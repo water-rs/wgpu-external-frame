@@ -1,6 +1,6 @@
 [package]
 name = "wgpu-external-frame"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 authors = ["Lexo Liu <me@lexo.cool>"]
