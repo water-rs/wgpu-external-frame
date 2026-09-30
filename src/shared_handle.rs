@@ -172,6 +172,14 @@ impl SharedHandleFrame {
         };
         // SAFETY: `hal_texture` was built for this device with `descriptor`'s
         // format and size, and is moved into the wgpu texture that now owns it.
-        unsafe { device.create_texture_from_hal::<wgpu::hal::api::Dx12>(hal_texture, &descriptor) }
+        // The resource's contents are live and the texture's only usage is
+        // `COPY_SRC`, which is the state the first barrier is told it starts in.
+        unsafe {
+            device.create_texture_from_hal::<wgpu::hal::api::Dx12>(
+                hal_texture,
+                &descriptor,
+                wgpu::TextureUses::COPY_SRC,
+            )
+        }
     }
 }

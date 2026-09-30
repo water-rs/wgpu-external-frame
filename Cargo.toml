@@ -30,7 +30,7 @@ undocumented_unsafe_blocks = "warn"
 multiple_crate_versions = "allow"
 
 [dependencies]
-wgpu = "29.0.4"
+wgpu = "30.0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = "0.38"
