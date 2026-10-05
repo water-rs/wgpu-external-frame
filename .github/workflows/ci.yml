@@ -49,7 +49,7 @@ jobs:
   # ubuntu-latest is too old to expose them — lavapipe only gained
   # `VK_EXT_external_memory_dma_buf` in Mesa 26. Running the tests against the
   # stock host Mesa would fail them, not skip them, so they run where the
-  # extension set exists. `/dev/udmabuf` must exist on the host before the
+  # extension set exists. `/dev/dri` must exist on the host before the
   # container starts, hence the `modprobe` outside the container.
   test-linux:
     name: Test / ubuntu-latest
@@ -64,18 +64,18 @@ jobs:
         libegl1 libgles2 libgl1-mesa-dri
     steps:
       - uses: actions/checkout@v4
-      # The `dma_buf` tests allocate their buffers through `udmabuf`. The
-      # runner's Azure kernel carries the module only in its
-      # `linux-modules-extra` package, and does not load it by default.
-      - name: Load the udmabuf module
+      # The `dma_buf` tests allocate their buffers through `vkms`, the
+      # virtual KMS driver. The runner's Azure kernel ships it in
+      # `linux-modules-extra` and does not load it by default.
+      - name: Load the vkms module
         run: |
           sudo apt-get update
           sudo apt-get install -y "linux-modules-extra-$(uname -r)"
-          sudo modprobe udmabuf
+          sudo modprobe vkms
       - name: Run the tests
         run: |
           docker run --rm \
-            --device /dev/udmabuf \
+            --device /dev/dri \
             -e CARGO_TERM_COLOR \
             -e CARGO_INCREMENTAL \
             -e CARGO_PROFILE_DEV_DEBUG \

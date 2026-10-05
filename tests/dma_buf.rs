@@ -1,16 +1,19 @@
 //! End-to-end tests of Vulkan and GLES DMA-BUF import.
 //!
-//! Each test allocates a DMA-BUF through `udmabuf` — a plain `memfd` exported
-//! as a DMA-BUF, so no DRM device is needed — writes a known pattern into it
-//! from the CPU, imports it on a `wgpu` device, and checks the texels the GPU
-//! ends up holding.
+//! Each test allocates a DMA-BUF as a DRM dumb buffer on `vkms`, the virtual
+//! KMS driver — real dumb-buffer ioctls and real PRIME export, no hardware —
+//! writes a known pattern into it from the CPU, imports it on a `wgpu`
+//! device, and checks the texels the GPU ends up holding.
 //!
-//! The tests assert the environment they need up front: `/dev/udmabuf`, an
-//! adapter for the backend under test, and the backend's own DMA-BUF import
-//! support — the `VK_KHR_external_memory_fd`,
+//! The tests assert the environment they need up front: a `vkms` card under
+//! `/dev/dri`, an adapter for the backend under test, and the backend's own
+//! DMA-BUF import support — the `VK_KHR_external_memory_fd`,
 //! `VK_EXT_external_memory_dma_buf`, and `VK_EXT_image_drm_format_modifier`
 //! device extensions on Vulkan, `EGL_EXT_image_dma_buf_import` on EGL/GLES.
-//! Any of those missing fails the test rather than skipping it.
+//! Any of those missing fails the test rather than skipping it. On lavapipe
+//! the Vulkan extension set is gated on `/dev/udmabuf` existing: without it
+//! Mesa does not advertise `VK_EXT_image_drm_format_modifier`, so the
+//! Vulkan tests need both devices passed through.
 #![cfg(target_os = "linux")]
 
 use std::io;
@@ -21,140 +24,250 @@ use wgpu_external_frame::dma_buf::{
     DmaBufFormat, DmaBufFrame, DmaBufImporter, DmaBufLease, DmaBufPlane,
 };
 
-/// `DRM_FORMAT_MOD_LINEAR` from `drm_fourcc.h`: the uncompressed linear
-/// layout a `udmabuf` buffer always has.
+/// `DRM_FORMAT_MOD_LINEAR` from `drm_fourcc.h`: the only layout a dumb
+/// buffer has.
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 48;
-/// The frame's row pitch. `u32` throughout because `DmaBufPlane::stride` is.
-const STRIDE: u32 = WIDTH * 4;
 
-/// Mirrors `struct udmabuf_create` in `linux/udmabuf.h`.
+/// Mirrors `struct drm_version` in `drm.h`. The pointers are buffers the
+/// kernel writes into; the `_len` fields carry `__kernel_size_t`.
 #[repr(C)]
-struct UdmabufCreate {
-    memfd: u32,
+struct DrmVersion {
+    major: i32,
+    minor: i32,
+    patchlevel: i32,
+    name_len: usize,
+    name: *mut u8,
+    date_len: usize,
+    date: *mut u8,
+    desc_len: usize,
+    desc: *mut u8,
+}
+
+/// Mirrors `struct drm_mode_create_dumb` in `drm_mode.h`.
+#[repr(C)]
+struct DrmCreateDumb {
+    height: u32,
+    width: u32,
+    bpp: u32,
     flags: u32,
-    offset: u64,
+    handle: u32,
+    pitch: u32,
     size: u64,
 }
 
-const UDMABUF_FLAGS_CLOEXEC: u32 = 0x01;
-// `_IOW('u', 0x42, struct udmabuf_create)` for a 24-byte struct.
-const UDMABUF_CREATE: libc::c_ulong = 0x4018_7542;
+/// Mirrors `struct drm_mode_map_dumb` in `drm_mode.h`.
+#[repr(C)]
+struct DrmMapDumb {
+    handle: u32,
+    pad: u32,
+    offset: u64,
+}
 
-/// A CPU-writable DMA-BUF: a `memfd` exported through `udmabuf`.
-struct Udmabuf {
-    /// The memory the buffer shares; writing it writes the buffer's pixels.
-    /// The kernel references it from the DMA-BUF for as long as `fd` lives.
-    _memfd: OwnedFd,
-    /// The DMA-BUF descriptor, duplicated into each frame built from this.
+/// Mirrors `struct drm_mode_destroy_dumb` in `drm_mode.h`.
+#[repr(C)]
+struct DrmDestroyDumb {
+    handle: u32,
+}
+
+/// Mirrors `struct drm_prime_handle` in `drm.h`.
+#[repr(C)]
+struct DrmPrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+}
+
+// The `drm.h` ioctl numbers, already encoded: `_IOW`/`_IOWR` with type 'd'.
+const DRM_IOCTL_VERSION: libc::c_ulong = 0xc040_6400;
+const DRM_IOCTL_PRIME_HANDLE_TO_FD: libc::c_ulong = 0xc00c_642d;
+const DRM_IOCTL_MODE_CREATE_DUMB: libc::c_ulong = 0xc020_64b2;
+const DRM_IOCTL_MODE_MAP_DUMB: libc::c_ulong = 0xc010_64b3;
+const DRM_IOCTL_MODE_DESTROY_DUMB: libc::c_ulong = 0xc004_64b4;
+
+/// `PRIME_HANDLE_TO_FD`'s `flags`: `DRM_RDWR | DRM_CLOEXEC` — read/write
+/// access for the importer, close-on-exec so the descriptor cannot leak.
+const PRIME_FD_FLAGS: u32 = (libc::O_RDWR | libc::O_CLOEXEC) as u32;
+
+/// A CPU-writable DMA-BUF: a DRM dumb buffer allocated on `vkms`.
+///
+/// `vkms` is the kernel's virtual KMS driver — no hardware, but real
+/// dumb-buffer ioctls and real PRIME export. Its buffers are linear and
+/// CPU-mappable, so the same allocation takes the pattern write and the
+/// import.
+struct DumbBuf {
+    /// The `vkms` card the buffer lives on; it stays open because every
+    /// ioctl on `handle` goes through it.
+    card: std::fs::File,
+    /// The GEM handle `CREATE_DUMB` returned on `card`.
+    handle: u32,
+    /// The DMA-BUF descriptor exported from `handle`, duplicated into each
+    /// frame built from this buffer.
     fd: OwnedFd,
-    /// Byte size of the allocation, always a whole number of pages.
+    /// Row pitch in bytes, as `CREATE_DUMB` decided it.
+    pitch: u32,
+    /// Byte size of the allocation, as `CREATE_DUMB` decided it.
     size: usize,
 }
 
-impl Udmabuf {
-    /// Allocates `size` bytes, rounded up to a whole page, as a DMA-BUF.
-    ///
-    /// `udmabuf` needs no GPU: it wraps an existing `memfd` in a DMA-BUF, so
-    /// the same mapping serves CPU writes and the importer's reads.
-    fn allocate(size: usize) -> Self {
-        // SAFETY: `sysconf` is a read-only query; `_SC_PAGESIZE` is a valid
-        // name for it on every Linux system.
-        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-            .expect("the system always reports a page size");
-        let size = size.next_multiple_of(page_size);
-        let device = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .open("/dev/udmabuf")
-            .expect("allocating a DMA-BUF requires /dev/udmabuf");
-        // SAFETY: `memfd_create` takes a NUL-terminated name, which a `c""`
-        // literal supplies, and `MFD_CLOEXEC | MFD_ALLOW_SEALING` is a valid
-        // flag set — `udmabuf` rejects memfds it cannot seal.
-        let memfd = unsafe {
-            libc::memfd_create(
-                c"wgpu_external_frame_dma_buf".as_ptr(),
-                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
-            )
+impl DumbBuf {
+    /// Allocates a `width`×`height` dumb buffer on the `vkms` card and
+    /// exports it as a DMA-BUF.
+    fn allocate(width: u32, height: u32) -> Self {
+        let card = Self::open_vkms();
+        let mut create = DrmCreateDumb {
+            height,
+            width,
+            bpp: 32,
+            flags: 0,
+            handle: 0,
+            pitch: 0,
+            size: 0,
         };
-        assert!(
-            memfd >= 0,
-            "memfd_create failed: {}",
-            io::Error::last_os_error()
-        );
-        // SAFETY: `memfd` was just returned open by `memfd_create`.
-        let memfd = unsafe { OwnedFd::from_raw_fd(memfd) };
-        let size_t = libc::off_t::try_from(size).expect("the buffer size fits off_t");
         assert_eq!(
-            // SAFETY: `ftruncate` sizes the `memfd` this function just
-            // created and still owns; `size_t` is non-negative.
-            unsafe { libc::ftruncate(memfd.as_raw_fd(), size_t) },
+            // SAFETY: `CREATE_DUMB` writes the `drm_mode_create_dumb` passed
+            // by pointer — `create` is a live local for the call — and fills
+            // its `handle`/`pitch`/`size` outputs.
+            unsafe { libc::ioctl(card.as_raw_fd(), DRM_IOCTL_MODE_CREATE_DUMB, &mut create) },
             0,
-            "ftruncate failed: {}",
+            "DRM_IOCTL_MODE_CREATE_DUMB failed: {}",
             io::Error::last_os_error()
         );
-        // `udmabuf` wants `F_SEAL_SHRINK` on the backing `memfd` (and rejects
-        // `F_SEAL_WRITE`); sealing after `ftruncate` keeps the size fixed.
-        assert_ne!(
-            // SAFETY: `fcntl` on a `memfd` created with `MFD_ALLOW_SEALING`
-            // adds the seals given; `memfd` is open and still owned here.
-            unsafe { libc::fcntl(memfd.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_SHRINK,) },
-            -1,
-            "sealing the memfd failed: {}",
-            io::Error::last_os_error()
-        );
-        let create = UdmabufCreate {
-            memfd: u32::try_from(memfd.as_raw_fd()).expect("the memfd fits u32"),
-            flags: UDMABUF_FLAGS_CLOEXEC,
-            offset: 0,
-            size: u64::try_from(size).expect("the buffer size fits u64"),
+        let mut prime = DrmPrimeHandle {
+            handle: create.handle,
+            flags: PRIME_FD_FLAGS,
+            fd: -1,
         };
-        // SAFETY: `UDMABUF_CREATE` reads the `udmabuf_create` struct passed
-        // by pointer — `create` is a fully initialized local that outlives
-        // the call — and returns a new descriptor or -1.
-        let fd = unsafe { libc::ioctl(device.as_raw_fd(), UDMABUF_CREATE, &create) };
-        assert!(
-            fd >= 0,
-            "UDMABUF_CREATE failed: {}",
+        assert_eq!(
+            // SAFETY: `PRIME_HANDLE_TO_FD` reads `prime.handle`, a live GEM
+            // handle on `card`, and writes `prime.fd`, the descriptor it returns.
+            unsafe { libc::ioctl(card.as_raw_fd(), DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut prime) },
+            0,
+            "DRM_IOCTL_PRIME_HANDLE_TO_FD failed: {}",
             io::Error::last_os_error()
         );
+        assert!(prime.fd >= 0, "PRIME_HANDLE_TO_FD returned no descriptor");
         Self {
-            _memfd: memfd,
-            // SAFETY: `fd` was just returned open by the ioctl.
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
-            size,
+            card,
+            handle: create.handle,
+            // SAFETY: `prime.fd` was just returned open by the ioctl.
+            fd: unsafe { OwnedFd::from_raw_fd(prime.fd) },
+            pitch: create.pitch,
+            size: usize::try_from(create.size).expect("the buffer size fits usize"),
         }
     }
 
-    /// Writes `texel(x, y)` into every pixel of the buffer, at `stride` bytes
-    /// per row.
-    fn fill(&self, stride: usize, texel: impl Fn(u32, u32) -> [u8; 4]) {
-        // SAFETY: `mmap` maps `self.size` bytes of `self.fd`, an open
-        // `udmabuf` descriptor whose mapping the kernel provides, shared so
-        // the writes land in the buffer itself.
+    /// Opens the `vkms` card under `/dev/dri`, identified by the driver's own
+    /// name — not by a fixed node, since `card0` is not guaranteed to be it.
+    fn open_vkms() -> std::fs::File {
+        let entries = std::fs::read_dir("/dev/dri")
+            .expect("allocating a DMA-BUF requires /dev/dri (the tests need `modprobe vkms`)");
+        let mut card = None;
+        for entry in entries {
+            let path = entry.expect("reading /dev/dri failed").path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("card") {
+                continue;
+            }
+            let file = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap_or_else(|error| panic!("opening {} failed: {error}", path.display()));
+            if Self::driver_name(&file) == "vkms" {
+                card = Some(file);
+                break;
+            }
+        }
+        card.expect("no vkms card under /dev/dri — the tests need vkms loaded")
+    }
+
+    /// The DRM driver's name for `card`, via `DRM_IOCTL_VERSION`.
+    fn driver_name(card: &std::fs::File) -> String {
+        let mut version = DrmVersion {
+            major: 0,
+            minor: 0,
+            patchlevel: 0,
+            name_len: 0,
+            name: std::ptr::null_mut(),
+            date_len: 0,
+            date: std::ptr::null_mut(),
+            desc_len: 0,
+            desc: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            // SAFETY: `VERSION` reads `version`'s length fields and writes
+            // back the lengths the buffers would need; no buffers are
+            // passed, so nothing else is touched.
+            unsafe { libc::ioctl(card.as_raw_fd(), DRM_IOCTL_VERSION, &mut version) },
+            0,
+            "DRM_IOCTL_VERSION failed: {}",
+            io::Error::last_os_error()
+        );
+        let mut name = vec![0u8; version.name_len];
+        version.name = name.as_mut_ptr();
+        assert_eq!(
+            // SAFETY: `version.name` points at `name_len` writable bytes, which
+            // is exactly what the previous call asked for.
+            unsafe { libc::ioctl(card.as_raw_fd(), DRM_IOCTL_VERSION, &mut version) },
+            0,
+            "DRM_IOCTL_VERSION failed: {}",
+            io::Error::last_os_error()
+        );
+        String::from_utf8(name).expect("the DRM driver name is ASCII")
+    }
+
+    /// Writes `texel(x, y)` into every pixel of the buffer, at `self.pitch`
+    /// bytes per row.
+    fn fill(&self, texel: impl Fn(u32, u32) -> [u8; 4]) {
+        let mut map_dumb = DrmMapDumb {
+            handle: self.handle,
+            pad: 0,
+            offset: 0,
+        };
+        assert_eq!(
+            // SAFETY: `MAP_DUMB` reads `map_dumb.handle`, a live GEM handle on
+            // `card`, and writes `map_dumb.offset`, the `mmap` offset it returns.
+            unsafe {
+                libc::ioctl(
+                    self.card.as_raw_fd(),
+                    DRM_IOCTL_MODE_MAP_DUMB,
+                    &mut map_dumb,
+                )
+            },
+            0,
+            "DRM_IOCTL_MODE_MAP_DUMB failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: `mmap` maps `self.size` bytes of `card` at the offset
+        // `MAP_DUMB` returned, shared so the writes land in the buffer.
         let map = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 self.size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
-                self.fd.as_raw_fd(),
-                0,
+                self.card.as_raw_fd(),
+                libc::off_t::try_from(map_dumb.offset).expect("the map offset fits off_t"),
             )
         };
         assert_ne!(
             map,
             libc::MAP_FAILED,
-            "mmap of the DMA-BUF failed: {}",
+            "mmap of the dumb buffer failed: {}",
             io::Error::last_os_error()
         );
-        for y in 0..self.size / stride {
-            for x in 0..stride / 4 {
+        let stride = usize::try_from(self.pitch).expect("the pitch fits usize");
+        for y in 0..usize::try_from(HEIGHT).expect("HEIGHT fits usize") {
+            for x in 0..usize::try_from(WIDTH).expect("WIDTH fits usize") {
                 let offset = y * stride + x * 4;
-                // SAFETY: `map` covers `self.size` bytes and `offset` stays
-                // under `self.size`, as the loop bounds ensure.
+                assert!(offset + 4 <= self.size, "the pitch overflows the buffer");
+                // SAFETY: `map` covers `self.size` bytes and `offset + 4`
+                // stays within them, as the bounds just checked.
                 unsafe {
                     map.cast::<u8>().add(offset).copy_from_nonoverlapping(
                         texel(
@@ -173,14 +286,14 @@ impl Udmabuf {
             // are done.
             unsafe { libc::munmap(map, self.size) },
             0,
-            "munmap of the DMA-BUF failed: {}",
+            "munmap of the dumb buffer failed: {}",
             io::Error::last_os_error()
         );
     }
 
-    /// A frame presenting `buffer` as one linear RGBA plane.
+    /// A frame presenting the buffer as one linear RGBA plane.
     fn frame(&self, lease: Box<dyn DmaBufLease>) -> DmaBufFrame {
-        // SAFETY: `buffer.fd` is open; `dup` returns a fresh descriptor or -1.
+        // SAFETY: `self.fd` is open; `dup` returns a fresh descriptor or -1.
         let fd = unsafe { libc::dup(self.fd.as_raw_fd()) };
         assert!(
             fd >= 0,
@@ -197,11 +310,29 @@ impl Udmabuf {
             vec![DmaBufPlane {
                 fd,
                 offset: 0,
-                stride: STRIDE,
+                stride: self.pitch,
             }],
             None,
         )
         .with_lease(lease)
+    }
+}
+
+impl Drop for DumbBuf {
+    fn drop(&mut self) {
+        let mut destroy = DrmDestroyDumb {
+            handle: self.handle,
+        };
+        // SAFETY: `DESTROY_DUMB` reads `destroy.handle`, the live GEM handle
+        // this buffer still owns on `card`. The exported DMA-BUF keeps its
+        // own reference, so frames already built stay valid.
+        unsafe {
+            libc::ioctl(
+                self.card.as_raw_fd(),
+                DRM_IOCTL_MODE_DESTROY_DUMB,
+                &mut destroy,
+            );
+        }
     }
 }
 
@@ -482,8 +613,8 @@ fn expected_texels() -> Vec<u32> {
 /// returned texture sees exactly the pattern the CPU wrote.
 fn copy_to_texture_imports_the_frame_on(backends: wgpu::Backends) {
     let gpu = Gpu::new(backends);
-    let buffer = Udmabuf::allocate(usize::try_from(STRIDE * HEIGHT).expect("fits usize"));
-    buffer.fill(usize::try_from(STRIDE).expect("fits usize"), texel);
+    let buffer = DumbBuf::allocate(WIDTH, HEIGHT);
+    buffer.fill(texel);
     let (events, received) = mpsc::channel();
     let texture = gpu
         .importer
@@ -512,8 +643,8 @@ fn copy_into_orders_the_copy_before_caller_commands_on(
     expected_command_buffers: usize,
 ) {
     let gpu = Gpu::new(backends);
-    let buffer = Udmabuf::allocate(usize::try_from(STRIDE * HEIGHT).expect("fits usize"));
-    buffer.fill(usize::try_from(STRIDE).expect("fits usize"), texel);
+    let buffer = DumbBuf::allocate(WIDTH, HEIGHT);
+    buffer.fill(texel);
     let (events, received) = mpsc::channel();
     let destination = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("dma_buf_copy_into_destination"),
