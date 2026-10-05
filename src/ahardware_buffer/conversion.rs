@@ -10,8 +10,9 @@
 //!
 //! The objects that depend only on the device ([`Shared`]) and those that
 //! depend on the buffer's conversion parameters ([`ConversionPipeline`]) are
-//! created once and cached; each frame creates only the views, framebuffers
-//! and descriptor set that name its own images ([`ConversionFrame`]).
+//! created once and cached; each frame creates only the views and
+//! framebuffers that name its own images ([`ConversionFrame`]), and pushes the
+//! descriptor that binds its source into the command buffer that converts it.
 
 use core::ops::Deref;
 use std::collections::HashMap;
@@ -112,7 +113,6 @@ pub(super) fn import(
             chroma: chroma.image,
             extent,
         },
-        converter.descriptor_count(),
     );
     let source = imported.image();
     let acquire_semaphore = imported.acquire_semaphore();
@@ -266,9 +266,6 @@ struct ConversionKey {
 /// set of conversion parameters.
 pub(super) struct Converter {
     shared: Arc<Shared>,
-    /// How many descriptors one combined image sampler with an external
-    /// format may consume, which sizes each frame's descriptor pool.
-    descriptor_count: u32,
     pipelines: HashMap<ConversionKey, Arc<ConversionPipeline>>,
 }
 
@@ -276,7 +273,6 @@ impl core::fmt::Debug for Converter {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_struct("Converter")
-            .field("descriptor_count", &self.descriptor_count)
             .field("pipelines", &self.pipelines.keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
@@ -285,18 +281,16 @@ impl core::fmt::Debug for Converter {
 impl Converter {
     /// Creates the device-wide objects of the conversion.
     ///
-    /// A combined image sampler of an external format may consume several
-    /// descriptors, and the only bound Vulkan offers for it is
-    /// `maxCombinedImageSamplerDescriptorCount`, from Vulkan 1.4 or
-    /// `VK_KHR_maintenance6`. Returns `None` on a device that reports
-    /// neither, since its descriptor pools cannot be sized.
-    pub(super) fn new(hal_device: &wgpu::hal::vulkan::Device) -> Option<Self> {
-        let descriptor_count = combined_image_sampler_descriptor_count(hal_device)?;
-        Some(Self {
-            shared: Arc::new(Shared::new(hal_device.raw_device())),
-            descriptor_count,
+    /// `hal_device` must enable every one of [`super::DEVICE_EXTENSIONS`],
+    /// which `HardwareBufferImporter::new` asserts.
+    pub(super) fn new(hal_device: &wgpu::hal::vulkan::Device) -> Self {
+        Self {
+            shared: Arc::new(Shared::new(
+                hal_device.shared_instance().raw_instance(),
+                hal_device.raw_device(),
+            )),
             pipelines: HashMap::new(),
-        })
+        }
     }
 
     /// The pipeline that converts buffers with `properties`, created on first
@@ -313,51 +307,14 @@ impl Converter {
             }),
         )
     }
-
-    pub(super) const fn descriptor_count(&self) -> u32 {
-        self.descriptor_count
-    }
 }
 
-/// Reads `maxCombinedImageSamplerDescriptorCount`, when the device has it.
-fn combined_image_sampler_descriptor_count(hal_device: &wgpu::hal::vulkan::Device) -> Option<u32> {
-    let instance = hal_device.shared_instance().raw_instance();
-    let physical_device = hal_device.raw_physical_device();
-    // SAFETY: the instance and physical device come from the live hal device
-    // guard the caller holds, so they are valid and belong together. The
-    // query only reads them.
-    let api_version =
-        unsafe { instance.get_physical_device_properties(physical_device) }.api_version;
-    // `ash` predates Vulkan 1.4 and has no constant for it.
-    let has_maintenance6 = api_version >= vk::make_api_version(0, 1, 4, 0) || {
-        // SAFETY: as above; the call enumerates the device's extensions
-        // without changing anything.
-        let extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
-            .unwrap_or_else(|error| {
-                panic!("failed to enumerate the Vulkan device's extensions: {error}")
-            });
-        extensions.iter().any(|extension| {
-            extension.extension_name_as_c_str() == Ok(ash::khr::maintenance6::NAME)
-        })
-    };
-    if !has_maintenance6 {
-        return None;
-    }
-    let mut maintenance6 = vk::PhysicalDeviceMaintenance6PropertiesKHR::default();
-    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut maintenance6);
-    // SAFETY: the physical device supports Vulkan 1.4 or
-    // `VK_KHR_maintenance6`, either of which makes the chained properties
-    // struct valid to query, and the instance the hal device runs on is at
-    // least Vulkan 1.1, which `vkGetPhysicalDeviceProperties2` needs. Both
-    // structs are initialized locals the call writes through.
-    unsafe { instance.get_physical_device_properties2(physical_device, &mut properties) };
-    Some(maintenance6.max_combined_image_sampler_descriptor_count)
-}
-
-/// The conversion's objects that depend only on the device: the shaders and
-/// the render passes that write each plane.
+/// The conversion's objects that depend only on the device: the shaders, the
+/// render passes that write each plane, and the `VK_KHR_push_descriptor`
+/// entry points that bind the source.
 struct Shared {
     device: ash::Device,
+    push_descriptor: ash::khr::push_descriptor::Device,
     vertex: vk::ShaderModule,
     fragment: vk::ShaderModule,
     luma_pass: vk::RenderPass,
@@ -365,11 +322,14 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(device: &ash::Device) -> Self {
+    /// `device` must have been created from `instance` with
+    /// `VK_KHR_push_descriptor` enabled.
+    fn new(instance: &ash::Instance, device: &ash::Device) -> Self {
         let vertex = shader_module(device, VERTEX_SPIRV);
         let fragment = shader_module(device, FRAGMENT_SPIRV);
         Self {
             device: device.clone(),
+            push_descriptor: ash::khr::push_descriptor::Device::new(instance, device),
             vertex,
             fragment,
             luma_pass: plane_render_pass(device, LUMA_FORMAT.1),
@@ -535,11 +495,38 @@ impl ConversionPipeline {
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .immutable_samplers(core::slice::from_ref(&sampler));
-        let set_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(core::slice::from_ref(&binding));
+        // The source is bound with a push descriptor rather than a descriptor
+        // set, because a set must come from a pool, and the specification
+        // gives the number of pool descriptors a combined image sampler of an
+        // Android external format consumes only through
+        // `maxCombinedImageSamplerDescriptorCount` (the note under
+        // `VkDescriptorPoolSize`), which only Vulkan 1.4 and
+        // `VK_KHR_maintenance6` report. Push descriptors are stored by the
+        // command buffer ("whose storage is internally managed by the command
+        // buffer", `vkCmdPushDescriptorSet`), so no count is needed.
+        //
+        // A push-descriptor layout may carry an immutable YCbCr sampler:
+        // - `VUID-VkDescriptorSetLayoutCreateInfo-flags-00280`, `-02208` and
+        //   `-04591` exclude only dynamic buffers, inline uniform blocks and
+        //   mutable descriptors from such a layout, and
+        //   `VUID-VkDescriptorSetLayoutBinding-descriptorType-12200` only asks
+        //   that every immutable sampler of the binding enable a conversion,
+        //   as this one does;
+        // - `vkCmdPushDescriptorSet` says of a `COMBINED_IMAGE_SAMPLER` write
+        //   that "the sampler member of the pImageInfo parameter is ignored
+        //   and the immutable sampler is taken from the push descriptor set
+        //   layout in the pipeline layout";
+        // - `VUID-VkDescriptorSetLayoutCreateInfo-flags-00281` bounds the
+        //   layout's elements by `maxPushDescriptors`, whose required minimum
+        //   is 32; this layout has one.
+        let set_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR)
+            .bindings(core::slice::from_ref(&binding));
         // SAFETY: a YCbCr conversion sampler must be bound as an immutable
         // sampler of a combined image sampler, which this one binding is; the
-        // sampler was created on `device` just above.
+        // sampler was created on `device` just above. The push-descriptor flag
+        // needs `VK_KHR_push_descriptor`, which the device enables, and is
+        // valid for this binding as the comment above sets out.
         let set_layout = unsafe { device.create_descriptor_set_layout(&set_layout_info, None) }
             .unwrap_or_else(|error| {
                 panic!("failed to create the YCbCr conversion descriptor set layout: {error}")
@@ -688,7 +675,7 @@ pub(super) struct ConversionTargets {
 }
 
 /// One frame's conversion objects: the views and framebuffers that name its
-/// images and the descriptor set that binds the source.
+/// images.
 ///
 /// They are used only by the submission that records the conversion, and are
 /// destroyed once it has completed.
@@ -696,8 +683,6 @@ pub(super) struct ConversionFrame {
     pipeline: Arc<ConversionPipeline>,
     extent: vk::Extent2D,
     source_view: vk::ImageView,
-    descriptor_pool: vk::DescriptorPool,
-    descriptor_set: vk::DescriptorSet,
     luma_view: vk::ImageView,
     chroma_view: vk::ImageView,
     luma_framebuffer: vk::Framebuffer,
@@ -705,11 +690,7 @@ pub(super) struct ConversionFrame {
 }
 
 impl ConversionFrame {
-    pub(super) fn new(
-        pipeline: Arc<ConversionPipeline>,
-        targets: &ConversionTargets,
-        descriptor_count: u32,
-    ) -> Self {
+    pub(super) fn new(pipeline: Arc<ConversionPipeline>, targets: &ConversionTargets) -> Self {
         let device = &pipeline.shared.device;
         let mut conversion_binding =
             vk::SamplerYcbcrConversionInfo::default().conversion(pipeline.conversion);
@@ -731,16 +712,12 @@ impl ConversionFrame {
         let mut frame = Self {
             extent: targets.extent,
             source_view,
-            descriptor_pool: vk::DescriptorPool::null(),
-            descriptor_set: vk::DescriptorSet::null(),
             luma_view: vk::ImageView::null(),
             chroma_view: vk::ImageView::null(),
             luma_framebuffer: vk::Framebuffer::null(),
             chroma_framebuffer: vk::Framebuffer::null(),
             pipeline,
         };
-        frame.descriptor_pool = frame.create_descriptor_pool(descriptor_count);
-        frame.descriptor_set = frame.allocate_descriptor_set();
         let chroma_extent = vk::Extent2D {
             width: targets.extent.width / 2,
             height: targets.extent.height / 2,
@@ -762,48 +739,6 @@ impl ConversionFrame {
 
     fn device(&self) -> &ash::Device {
         &self.pipeline.shared.device
-    }
-
-    fn create_descriptor_pool(&self, descriptor_count: u32) -> vk::DescriptorPool {
-        let size = vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(descriptor_count);
-        let create_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(1)
-            .pool_sizes(core::slice::from_ref(&size));
-        // SAFETY: one set of one combined image sampler, sized by
-        // `maxCombinedImageSamplerDescriptorCount` as the specification
-        // requires for an external format's sampler.
-        unsafe { self.device().create_descriptor_pool(&create_info, None) }.unwrap_or_else(
-            |error| panic!("failed to create the YCbCr conversion descriptor pool: {error}"),
-        )
-    }
-
-    fn allocate_descriptor_set(&self) -> vk::DescriptorSet {
-        let set_layouts = [self.pipeline.set_layout];
-        let allocate_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(self.descriptor_pool)
-            .set_layouts(&set_layouts);
-        // SAFETY: the pool was created on this device for exactly one set of
-        // this layout and nothing has been allocated from it yet.
-        let descriptor_set = unsafe { self.device().allocate_descriptor_sets(&allocate_info) }
-            .unwrap_or_else(|error| {
-                panic!("failed to allocate the YCbCr conversion descriptor set: {error}")
-            })[0];
-        let image_info = vk::DescriptorImageInfo::default()
-            .image_view(self.source_view)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(core::slice::from_ref(&image_info));
-        // SAFETY: the set was just allocated and is not in use. Its binding is
-        // a combined image sampler with an immutable sampler, so the write
-        // supplies only the view — created with the same conversion — and the
-        // layout the acquire barrier moves the image into before it is read.
-        unsafe { self.device().update_descriptor_sets(&[write], &[]) };
-        descriptor_set
     }
 
     fn plane_view(&self, image: vk::Image, format: vk::Format) -> vk::ImageView {
@@ -853,9 +788,36 @@ impl ConversionFrame {
             width: self.extent.width / 2,
             height: self.extent.height / 2,
         };
-        // SAFETY: the caller's contract, with each plane's framebuffer,
-        // pipeline and extent belonging together.
+        // The sampler is ignored: the binding's immutable YCbCr sampler is
+        // used instead.
+        let image_info = vk::DescriptorImageInfo::default()
+            .image_view(self.source_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(core::slice::from_ref(&image_info));
+        // SAFETY: the caller guarantees a recording command buffer. Set 0 is
+        // the pipeline layout's only set, created with the push-descriptor
+        // flag, and the write fills its one combined image sampler with a
+        // view of the source created with the same conversion as the
+        // binding's immutable sampler, in the layout the acquire barrier moves
+        // the image into before it is read. Both plane pipelines share this
+        // layout, so binding either keeps the pushed descriptor, which every
+        // draw below reads. The plane recordings rest on the caller's
+        // contract, with each plane's framebuffer, pipeline and extent
+        // belonging together.
         unsafe {
+            self.pipeline
+                .shared
+                .push_descriptor
+                .cmd_push_descriptor_set(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline.layout,
+                    0,
+                    core::slice::from_ref(&write),
+                );
             self.record_plane(
                 command_buffer,
                 self.luma_framebuffer,
@@ -875,8 +837,9 @@ impl ConversionFrame {
 
     /// # Safety
     ///
-    /// As [`Self::record`], and `framebuffer`, `render_pass` and `pipeline`
-    /// must be one plane's, at that plane's `extent`.
+    /// As [`Self::record`], after the source's descriptor has been pushed,
+    /// and `framebuffer`, `render_pass` and `pipeline` must be one plane's, at
+    /// that plane's `extent`.
     unsafe fn record_plane(
         &self,
         command_buffer: vk::CommandBuffer,
@@ -903,21 +866,13 @@ impl ConversionFrame {
         // render pass, and that the framebuffer, render pass and pipeline are
         // one plane's. The render area is the framebuffer's whole extent, the
         // load op needs no clear values, the dynamic viewport and scissor are
-        // set before the draw, and the descriptor set matches the pipeline
-        // layout. The draw of three vertices needs no vertex buffer.
+        // set before the draw, and the pipeline's one descriptor has been
+        // pushed. The draw of three vertices needs no vertex buffer.
         unsafe {
             device.cmd_begin_render_pass(command_buffer, &begin, vk::SubpassContents::INLINE);
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
             device.cmd_set_viewport(command_buffer, 0, &[viewport]);
             device.cmd_set_scissor(command_buffer, 0, &[area]);
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline.layout,
-                0,
-                &[self.descriptor_set],
-                &[],
-            );
             device.cmd_draw(command_buffer, 3, 1, 0, 0);
             device.cmd_end_render_pass(command_buffer);
         }
@@ -932,13 +887,11 @@ impl Drop for ConversionFrame {
         // accept — is owned solely by this value and destroyed once,
         // dependents first. A frame is dropped only once the submission that
         // recorded it has completed, so the GPU no longer uses any of them.
-        // Destroying the pool frees its set.
         unsafe {
             device.destroy_framebuffer(self.chroma_framebuffer, None);
             device.destroy_framebuffer(self.luma_framebuffer, None);
             device.destroy_image_view(self.chroma_view, None);
             device.destroy_image_view(self.luma_view, None);
-            device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_image_view(self.source_view, None);
         }
     }

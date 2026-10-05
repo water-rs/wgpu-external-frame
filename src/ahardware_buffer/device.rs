@@ -17,13 +17,19 @@ use ash::vk;
 ///   transfer every import performs.
 /// - `VK_KHR_external_semaphore_fd` turns the producer's acquire fence into a
 ///   semaphore the GPU waits on.
+/// - `VK_KHR_push_descriptor` binds the sampler of the external-format YCbCr
+///   conversion. Vulkan 1.4 made push descriptors core, but `wgpu-hal`
+///   creates its instance for Vulkan 1.3 at most, and a device may only use
+///   core functionality up to that version, so the extension is the only way
+///   a `wgpu` device has to push descriptors.
 ///
-/// The remaining dependencies of the hardware-buffer extension are core in
-/// Vulkan 1.1, which [`request_device`] requires.
-pub const DEVICE_EXTENSIONS: [&CStr; 3] = [
+/// The remaining dependencies of these extensions are core in Vulkan 1.1,
+/// which [`request_device`] requires.
+pub const DEVICE_EXTENSIONS: [&CStr; 4] = [
     ash::android::external_memory_android_hardware_buffer::NAME,
     ash::ext::queue_family_foreign::NAME,
     ash::khr::external_semaphore_fd::NAME,
+    ash::khr::push_descriptor::NAME,
 ];
 
 /// What an `AHardwareBuffer` import needs of a Vulkan device beyond `wgpu`.

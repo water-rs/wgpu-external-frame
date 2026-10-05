@@ -44,11 +44,10 @@
 //! is every such buffer, camera frames included. `wgpu` cannot express that
 //! sampler, so the import samples the buffer in a small raw Vulkan pass,
 //! submitted on the importer's queue, that writes the stored codes into two
-//! textures `wgpu` owns. No pixel passes through the CPU. The pass needs the `samplerYcbcrConversion`
-//! feature, which [`request_device`] enables, and Vulkan 1.4 or
-//! `VK_KHR_maintenance6`, without which the import rejects such a buffer with
-//! [`HardwareBufferImportError::ConversionUnavailable`]. Only `Y8Cb8Cr8_420`
-//! buffers are converted, since only their format says the samples are 8-bit
+//! textures `wgpu` owns. No pixel passes through the CPU. The pass needs the
+//! `samplerYcbcrConversion` feature and `VK_KHR_push_descriptor`, which
+//! [`request_device`] checks for and enables. Only `Y8Cb8Cr8_420` buffers are
+//! converted, since only their format says the samples are 8-bit
 //! 4:2:0; an external-format buffer of any other format, such as
 //! `YCbCr_P010`, is rejected with [`HardwareBufferImportError::ExternalFormat`].
 //! The pass exists only because `wgpu` has no YCbCr sampler; once it gains
@@ -113,17 +112,6 @@ pub enum HardwareBufferImportError {
     ExternalFormat {
         /// The buffer's own format.
         format: HardwareBufferFormat,
-        /// The driver's implementation-defined format identifier.
-        external_format: u64,
-    },
-    /// The buffer needs the external-format conversion, which this device
-    /// cannot run: sizing the descriptor pool of its sampler needs Vulkan 1.4
-    /// or `VK_KHR_maintenance6`, and the device has neither.
-    #[error(
-        "the AHardwareBuffer has only the external format {external_format:#x}, and converting \
-         it needs Vulkan 1.4 or VK_KHR_maintenance6, which this device has neither of"
-    )]
-    ConversionUnavailable {
         /// The driver's implementation-defined format identifier.
         external_format: u64,
     },
@@ -255,8 +243,7 @@ impl HardwareBufferImporter {
     /// Returns an error when the buffer is not GPU-sampled, protected,
     /// layered, of a format that has no `wgpu` equivalent, of an external
     /// format other than 8-bit 4:2:0 YCbCr, or of a YCbCr model that names no
-    /// matrix, or when the device cannot run the conversion an external
-    /// format needs. The frame, and with it the lease, is dropped.
+    /// matrix. The frame, and with it the lease, is dropped.
     ///
     /// # Panics
     ///
@@ -289,14 +276,9 @@ impl HardwareBufferImporter {
                     });
                 }
                 let encoding = ycbcr_encoding(&parts.description, &properties)?;
-                let converter = match &mut self.converter {
-                    Some(converter) => converter,
-                    empty => empty.insert(Converter::new(&hal_device).ok_or(
-                        HardwareBufferImportError::ConversionUnavailable {
-                            external_format: properties.external_format,
-                        },
-                    )?),
-                };
+                let converter = self
+                    .converter
+                    .get_or_insert_with(|| Converter::new(&hal_device));
                 let planes = conversion::import(
                     &self.device,
                     &self.queue,
