@@ -329,16 +329,7 @@ fn import_image_memory(
         type_bits != 0,
         "the DMA-BUF is incompatible with every Vulkan memory type"
     );
-    // SAFETY: the instance and physical device both come from the live hal
-    // device guard the caller holds, so they are valid and belong together.
-    // The query only reads them and returns a value.
-    let memory_properties = unsafe {
-        hal_device
-            .shared_instance()
-            .raw_instance()
-            .get_physical_device_memory_properties(hal_device.raw_physical_device())
-    };
-    let memory_type_index = select_memory_type(type_bits, &memory_properties);
+    let memory_type_index = crate::vulkan_memory::select_memory_type(hal_device, type_bits);
     let imported_fd = plane.fd.into_raw_fd();
     let mut import = vk::ImportMemoryFdInfoKHR::default()
         .handle_type(handle_type)
@@ -374,23 +365,4 @@ fn import_image_memory(
             panic!("failed to import the DMA-BUF as Vulkan memory: {error}");
         }
     }
-}
-
-fn select_memory_type(type_bits: u32, properties: &vk::PhysicalDeviceMemoryProperties) -> u32 {
-    let mut first = None;
-    for index in 0..properties.memory_type_count {
-        if type_bits & (1 << index) == 0 {
-            continue;
-        }
-        first.get_or_insert(index);
-        let memory_type = properties.memory_types
-            [usize::try_from(index).expect("Vulkan memory index must fit usize")];
-        if memory_type
-            .property_flags
-            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        {
-            return index;
-        }
-    }
-    first.expect("a compatible Vulkan memory type disappeared")
 }
