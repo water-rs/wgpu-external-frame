@@ -21,14 +21,25 @@ goal. The Linux and Android sides additionally model the producer's *lease* on
 the buffer (`DmaBufLease`, `HardwareBufferLease`), since those buffers usually
 come from a pool the producer needs back, guarded by an explicit fence.
 
-On Android the imported texture aliases the buffer itself, so nothing is
-copied. RGBA buffers import as `Rgba8Unorm`, and 4:2:0 YCbCr buffers that the
-Vulkan driver maps to `G8_B8R8_2PLANE_420_UNORM` import as `NV12`, read through
-plane views. A buffer the driver describes only with an implementation-defined
-external format is rejected: sampling it needs a `VkSamplerYcbcrConversion`,
-which `wgpu` cannot express. The device must be opened with the extensions the
-import needs, which `wgpu` does not enable on its own;
-`ahardware_buffer::request_device` does that.
+On Android an RGBA buffer imports as an `Rgba8Unorm` texture that aliases the
+buffer itself, so nothing is copied. A 4:2:0 YCbCr buffer imports as two plane
+views — luma `R8Unorm`, interleaved Cb/Cr `Rg8Unorm` — with the matrix and
+range the Vulkan driver reports for it:
+
+- when the driver maps the buffer to `G8_B8R8_2PLANE_420_UNORM`, the views are
+  planes of one `NV12` texture that aliases the buffer;
+- when the driver describes it only with an implementation-defined external
+  format, as some drivers do for every YCbCr buffer, camera frames included,
+  sampling it needs a `VkSamplerYcbcrConversion`, which `wgpu` cannot express.
+  The import then converts it on the GPU, in a small raw Vulkan pass on the
+  importer's queue, into two textures `wgpu` owns. No pixel passes through the
+  CPU.
+
+The device must be opened with the extensions and the YCbCr conversion feature
+the import needs, which `wgpu` does not enable on its own;
+`ahardware_buffer::request_device` does that. Building for Android compiles the
+conversion's GLSL shaders with the NDK's `glslc`, found through
+`ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT`.
 
 On Apple platforms, camera and video frames are biplanar 4:2:0 YCbCr surfaces,
 and each of their planes imports as its own texture at that plane's extent:

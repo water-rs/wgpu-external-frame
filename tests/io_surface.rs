@@ -19,9 +19,10 @@ use objc2_io_surface::{
     IOSurfaceLockOptions, IOSurfaceRef, kIOSurfaceBytesPerElement, kIOSurfaceHeight,
     kIOSurfacePixelFormat, kIOSurfaceWidth,
 };
+use wgpu_external_frame::YcbcrRange;
 use wgpu_external_frame::io_surface::{
     PackedFormat, PackedIoSurfaceFrame, Ycbcr420Format, Ycbcr420IoSurfaceFrame, Ycbcr420Plane,
-    YcbcrDepth, YcbcrRange,
+    YcbcrDepth,
 };
 
 /// Odd on purpose: the chroma plane's extent then has to be rounded up, which

@@ -13,6 +13,15 @@ pub(super) struct BufferProperties {
     /// when it only has an implementation-defined external format.
     pub(super) format: vk::Format,
     pub(super) external_format: u64,
+    /// The YCbCr model the driver suggests for sampling the buffer, which
+    /// names the matrix its samples were encoded with.
+    pub(super) suggested_model: vk::SamplerYcbcrModelConversion,
+    /// The code range the driver suggests the samples span.
+    pub(super) suggested_range: vk::SamplerYcbcrRange,
+    /// Where the driver says the chroma samples sit horizontally.
+    pub(super) x_chroma_offset: vk::ChromaLocation,
+    /// Where the driver says the chroma samples sit vertically.
+    pub(super) y_chroma_offset: vk::ChromaLocation,
 }
 
 /// The Vulkan objects one import created, destroyed together once the GPU has
@@ -107,16 +116,31 @@ pub(super) fn buffer_properties(
         memory_type_bits: properties.memory_type_bits,
         format: format_properties.format,
         external_format: format_properties.external_format,
+        suggested_model: format_properties.suggested_ycbcr_model,
+        suggested_range: format_properties.suggested_ycbcr_range,
+        x_chroma_offset: format_properties.suggested_x_chroma_offset,
+        y_chroma_offset: format_properties.suggested_y_chroma_offset,
     }
+}
+
+/// The format of the image created for an import.
+pub(super) enum ImageFormat {
+    /// A Vulkan format, which `wgpu` adopts the image as.
+    Defined {
+        format: vk::Format,
+        multi_planar: bool,
+    },
+    /// The driver's implementation-defined external format, which only a
+    /// sampler with a matching `VkSamplerYcbcrConversion` can read.
+    External(u64),
 }
 
 /// What the image created for an import looks like.
 pub(super) struct ImageShape {
-    pub(super) format: vk::Format,
+    pub(super) format: ImageFormat,
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) mip_levels: u32,
-    pub(super) multi_planar: bool,
     pub(super) usage: vk::ImageUsageFlags,
 }
 
@@ -130,21 +154,41 @@ pub(super) fn import_buffer(
     let raw = hal_device.raw_device();
     let mut external = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID);
-    // A plane view of a multi-planar image has a different format than the
-    // image, which Vulkan only allows on a mutable-format image; extended usage
-    // lets the plane views carry usages the multi-planar format itself lacks.
-    // The hardware-buffer usage-equivalence table maps neither flag to a buffer
-    // usage, so every buffer accepts them.
-    let flags = if shape.multi_planar {
-        vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE
-    } else {
-        vk::ImageCreateFlags::empty()
+    let (format, flags, external_format) = match shape.format {
+        // A plane view of a multi-planar image has a different format than
+        // the image, which Vulkan only allows on a mutable-format image;
+        // extended usage lets the plane views carry usages the multi-planar
+        // format itself lacks. The hardware-buffer usage-equivalence table
+        // maps neither flag to a buffer usage, so every buffer accepts them.
+        ImageFormat::Defined {
+            format,
+            multi_planar: true,
+        } => (
+            format,
+            vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
+            0,
+        ),
+        ImageFormat::Defined {
+            format,
+            multi_planar: false,
+        } => (format, vk::ImageCreateFlags::empty(), 0),
+        // An external-format image has no Vulkan format and takes no creation
+        // flags.
+        ImageFormat::External(external_format) => (
+            vk::Format::UNDEFINED,
+            vk::ImageCreateFlags::empty(),
+            external_format,
+        ),
     };
+    // A zero external format is the structure's "no external format" value,
+    // so chaining it for a defined-format image changes nothing.
+    let mut external_format = vk::ExternalFormatANDROID::default().external_format(external_format);
     let create_info = vk::ImageCreateInfo::default()
         .push_next(&mut external)
+        .push_next(&mut external_format)
         .flags(flags)
         .image_type(vk::ImageType::TYPE_2D)
-        .format(shape.format)
+        .format(format)
         .extent(vk::Extent3D {
             width: shape.width,
             height: shape.height,
@@ -157,14 +201,15 @@ pub(super) fn import_buffer(
         .usage(shape.usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .initial_layout(vk::ImageLayout::UNDEFINED);
-    // SAFETY: `create_info` is fully initialized and its one `push_next`
-    // struct is a local `mut` binding that outlives the call. The
-    // hardware-buffer handle type it names belongs to an extension
+    // SAFETY: `create_info` is fully initialized and both `push_next` structs
+    // are local `mut` bindings that outlive the call. The hardware-buffer
+    // handle type and the external-format struct belong to an extension
     // `validate_device` asserted enabled. The parameters are the ones the
     // memory import's valid usage demands of a dedicated image: the buffer's
     // width, height and single layer, the Vulkan format the driver reported
-    // for it, optimal tiling, one mip level unless the buffer carries a full
-    // chain, and usages that are either free or backed by the buffer's
+    // for it — or `UNDEFINED` with its external format, no flags and sampled
+    // usage only — optimal tiling, one mip level unless the buffer carries a
+    // full chain, and usages that are either free or backed by the buffer's
     // `GPU_SAMPLED_IMAGE` usage, which the caller checked.
     let image = unsafe { raw.create_image(&create_info, None) }.unwrap_or_else(|error| {
         panic!("failed to create the Vulkan image for an AHardwareBuffer: {error}")
@@ -250,7 +295,8 @@ fn import_acquire_fence(hal_device: &wgpu::hal::vulkan::Device, fence: OwnedFd) 
 
 /// Records the acquire of the imported image from the producer: an ownership
 /// transfer from the foreign queue family that also moves the image into the
-/// layout `wgpu` is told it starts in.
+/// layout its readers expect — the one `wgpu` is told an aliasing texture
+/// starts in, and the one the conversion samples.
 ///
 /// # Safety
 ///
@@ -291,7 +337,9 @@ pub(super) unsafe fn record_acquire(
     // family. The source stage is `ALL_COMMANDS`, so the barrier chains after
     // the acquire-fence semaphore wait at `ALL_COMMANDS`; the destination
     // stages and access are the ones `wgpu` uses for a texture in the
-    // `RESOURCE` state, which is the state it is told the texture starts in.
+    // `RESOURCE` state, which is the state it is told an aliasing texture
+    // starts in, and they include the fragment shader the conversion reads
+    // the image from.
     unsafe {
         device.cmd_pipeline_barrier(
             encoder.raw_handle(),

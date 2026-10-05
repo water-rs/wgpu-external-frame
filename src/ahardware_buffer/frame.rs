@@ -8,8 +8,7 @@ use ndk::hardware_buffer_format::HardwareBufferFormat;
 /// A producer such as `AImageReader` hands out buffers from a fixed pool and
 /// needs each one back — for `AImageReader`, by deleting the `AImage` that
 /// carries it. That is a two-step protocol: the buffer is imported, then the
-/// imported texture is dropped and every GPU submission reading it completes. This trait is both
-/// steps.
+/// GPU stops reading it. This trait is both steps.
 ///
 /// A lease is dropped rather than released whenever an import is abandoned
 /// before it reaches the GPU, so implementations must treat `Drop` as an
@@ -23,10 +22,12 @@ pub trait HardwareBufferLease: core::fmt::Debug + Send {
 
     /// Returns the buffer to the producer.
     ///
-    /// Called once the imported texture has been dropped and every submission
-    /// that used it has completed, so the producer may reuse the buffer at
-    /// once; there is no release fence to wait on. `wgpu` destroys textures
-    /// lazily, so this runs on whichever thread drives the device at that
+    /// Called once the GPU no longer reads the buffer, so the producer may
+    /// reuse it at once; there is no release fence to wait on. For a texture
+    /// that aliases the buffer, that is once the texture has been dropped and
+    /// every submission that used it has completed; for planes converted from
+    /// an external format, once the conversion has completed. `wgpu` reports
+    /// both lazily, so this runs on whichever thread drives the device at that
     /// moment — inside `wgpu::Device::poll` or `wgpu::Queue::submit` — and
     /// must not block on the GPU.
     fn release(self: Box<Self>);
@@ -67,7 +68,7 @@ impl core::fmt::Debug for BufferReference {
 /// fence and lease.
 ///
 /// The frame holds its own reference on the buffer, taken at construction, so
-/// the buffer stays valid however long the imported texture lives.
+/// the buffer stays valid for as long as the GPU reads it.
 #[derive(Debug)]
 pub struct HardwareBufferFrame {
     buffer: BufferReference,
