@@ -17,7 +17,8 @@
 //!   (`VK_EXT_external_memory_dma_buf`) or EGL
 //!   (`EGL_LINUX_DMA_BUF_EXT` plus `glEGLImageTargetTexture2DOES`), whichever
 //!   backend the `wgpu` device runs on.
-//! - [`io_surface`] — macOS `IOSurface`, imported through
+//! - [`io_surface`] — macOS and iOS `IOSurface`, packed RGBA/BGRA or
+//!   biplanar 4:2:0 YCbCr one plane per texture, imported through
 //!   `MTLDevice::newTextureWithDescriptor:iosurface:plane:`.
 //! - [`shared_handle`] — Windows shared texture handles, imported through
 //!   `ID3D12Device::OpenSharedHandle`.
@@ -28,7 +29,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod dma_buf;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod io_surface;
 #[cfg(target_os = "windows")]
 pub mod shared_handle;
