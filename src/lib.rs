@@ -42,3 +42,6 @@ pub mod io_surface;
 pub mod shared_handle;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod vulkan_memory;
+mod ycbcr;
+
+pub use ycbcr::{YcbcrEncoding, YcbcrMatrix, YcbcrRange};

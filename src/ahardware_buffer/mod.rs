@@ -18,25 +18,38 @@
 //!
 //! The format comes from the Vulkan driver's own reading of the buffer
 //! (`vkGetAndroidHardwareBufferPropertiesANDROID`), not from the buffer's
-//! description:
+//! description, and decides what [`HardwareBufferImporter::import`] returns:
 //!
-//! | Vulkan format the driver reports | `wgpu` texture | Usages |
+//! | Vulkan format the driver reports | [`ImportedHardwareBuffer`] | Textures |
 //! | --- | --- | --- |
-//! | `R8G8B8A8_UNORM` (`R8G8B8A8_UNORM`, `R8G8B8X8_UNORM` buffers) | `Rgba8Unorm` | `TEXTURE_BINDING`, `COPY_SRC` |
-//! | `G8_B8R8_2PLANE_420_UNORM` (`Y8Cb8Cr8_420` buffers, when the driver maps them) | `NV12` | `TEXTURE_BINDING` |
+//! | `R8G8B8A8_UNORM` (`R8G8B8A8_UNORM`, `R8G8B8X8_UNORM` buffers) | [`Rgba`](ImportedHardwareBuffer::Rgba) | one `Rgba8Unorm` texture that aliases the buffer |
+//! | `G8_B8R8_2PLANE_420_UNORM` (`Y8Cb8Cr8_420` buffers, when the driver maps them) | [`Ycbcr420`](ImportedHardwareBuffer::Ycbcr420) | the `Plane0` and `Plane1` views of one `NV12` texture that aliases the buffer |
+//! | `UNDEFINED`, with an implementation-defined *external format*, for a `Y8Cb8Cr8_420` buffer (camera frames and many allocated YCbCr buffers) | [`Ycbcr420`](ImportedHardwareBuffer::Ycbcr420) | an `R8Unorm` and an `Rg8Unorm` texture, converted from the buffer on the GPU |
 //!
-//! An `NV12` texture is read through plane views: `TextureAspect::Plane0` as
-//! `R8Unorm` for luma and `TextureAspect::Plane1` as `Rg8Unorm` for the
-//! interleaved Cb/Cr pair, which needs `wgpu::Features::TEXTURE_FORMAT_NV12`
-//! on the device.
+//! Both kinds of [`Ycbcr420Planes`] read the same way: a full-resolution luma
+//! plane sampled as `R8Unorm`, a half-resolution plane of interleaved Cb/Cr
+//! pairs sampled as `Rg8Unorm`, holding the stored codes, together with the
+//! [`YcbcrEncoding`](crate::YcbcrEncoding) the driver reports for the buffer.
+//! The aliased `NV12` texture needs `wgpu::Features::TEXTURE_FORMAT_NV12` on
+//! the device.
 //!
-//! A buffer the driver can only describe with an implementation-defined
-//! *external format* — Vulkan format `UNDEFINED`, typical of camera and video
-//! buffers allocated with `AIMAGE_FORMAT_PRIVATE` — is rejected with
-//! [`HardwareBufferImportError::ExternalFormat`]. Sampling such a buffer needs
-//! a `VkSamplerYcbcrConversion` bound into the pipeline, which `wgpu` cannot
-//! express; a producer that should be imported here has to be configured for a
-//! format with a Vulkan equivalent instead.
+//! # External formats
+//!
+//! Many drivers describe 4:2:0 YCbCr buffers only through an external format,
+//! which can be read only through a sampler carrying a
+//! `VkSamplerYcbcrConversion`; on some drivers, such as the Mali-G715's, that
+//! is every such buffer, camera frames included. `wgpu` cannot express that
+//! sampler, so the import samples the buffer in a small raw Vulkan pass,
+//! submitted on the importer's queue, that writes the stored codes into two
+//! textures `wgpu` owns. No pixel passes through the CPU. The pass needs the `samplerYcbcrConversion`
+//! feature, which [`request_device`] enables, and Vulkan 1.4 or
+//! `VK_KHR_maintenance6`, without which the import rejects such a buffer with
+//! [`HardwareBufferImportError::ConversionUnavailable`]. Only `Y8Cb8Cr8_420`
+//! buffers are converted, since only their format says the samples are 8-bit
+//! 4:2:0; an external-format buffer of any other format, such as
+//! `YCbCr_P010`, is rejected with [`HardwareBufferImportError::ExternalFormat`].
+//! The pass exists only because `wgpu` has no YCbCr sampler; once it gains
+//! one, these buffers import directly.
 //!
 //! # Ownership
 //!
@@ -47,49 +60,84 @@
 //! 1. The lease is told the frame was
 //!    [presented](HardwareBufferLease::presented), and the import submits the
 //!    acquire of the buffer from the producer's (foreign) queue family, which
-//!    waits on the acquire fence on the GPU.
-//! 2. The texture can be sampled for as long as the caller keeps it.
-//! 3. Once the texture is dropped and every submission that used it has
-//!    completed, `wgpu` destroys it; that releases the Vulkan objects, the
-//!    buffer reference, and finally the lease, which hands the buffer back to
-//!    the producer.
+//!    waits on the acquire fence on the GPU — together with the conversion,
+//!    for an external format.
+//! 2. Once nothing reads the buffer any more, the Vulkan objects and the
+//!    buffer reference are released, and finally the lease, which hands the
+//!    buffer back to the producer. For an aliasing import that is when its
+//!    texture has been dropped and every submission that used it has
+//!    completed; for a converted one, when the conversion has completed,
+//!    whatever the caller does with the planes.
 //!
-//! The texture is read-only — no usage lets the GPU write it — so the producer
-//! gets back exactly what it wrote.
+//! Neither path lets the GPU write the buffer, so the producer gets back
+//! exactly what it wrote.
 
+mod alias;
+mod conversion;
 mod device;
 mod frame;
 mod vulkan;
 
-pub use device::{DEVICE_EXTENSIONS, DeviceRequestError, request_device};
+pub use device::{DEVICE_EXTENSIONS, DeviceRequestError, DeviceRequirements, request_device};
 pub use frame::{HardwareBufferFrame, HardwareBufferLease};
 pub use ndk::hardware_buffer::{HardwareBuffer, HardwareBufferDesc, HardwareBufferUsage};
 pub use ndk::hardware_buffer_format::HardwareBufferFormat;
 
 use ash::vk;
-use frame::{BufferReference, FrameParts};
-use sync_wrapper::SyncWrapper;
-use vulkan::{ImageShape, ImportedImage};
+use conversion::Converter;
+use frame::BufferReference;
+use vulkan::{BufferProperties, ImportedImage};
+
+use crate::{YcbcrEncoding, YcbcrMatrix, YcbcrRange};
 
 /// Why a hardware buffer cannot be imported.
 ///
-/// Every variant is a property of the buffer the producer handed over, so the
-/// frame is dropped — releasing its lease — when an import is rejected.
+/// Every variant is a property of the buffer the producer handed over, or of
+/// the device it was handed to, so the frame is dropped — releasing its lease
+/// — when an import is rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum HardwareBufferImportError {
     /// The driver describes the buffer only through an implementation-defined
-    /// external format, which needs a `VkSamplerYcbcrConversion` that `wgpu`
-    /// cannot express.
+    /// external format, and the buffer's own format is not `Y8Cb8Cr8_420`,
+    /// the one whose samples the conversion knows to be 8-bit 4:2:0 YCbCr.
+    /// Converting anything else into 8-bit planes could silently drop
+    /// precision or misread the layout.
     #[error(
         "the AHardwareBuffer format {format:?} has no Vulkan format on this device, only the \
-         external format {external_format:#x}; sampling it needs a VkSamplerYcbcrConversion, \
-         which wgpu cannot express"
+         external format {external_format:#x}, and only Y8Cb8Cr8_420 buffers of an external \
+         format are converted"
     )]
     ExternalFormat {
         /// The buffer's own format.
         format: HardwareBufferFormat,
         /// The driver's implementation-defined format identifier.
         external_format: u64,
+    },
+    /// The buffer needs the external-format conversion, which this device
+    /// cannot run: sizing the descriptor pool of its sampler needs Vulkan 1.4
+    /// or `VK_KHR_maintenance6`, and the device has neither.
+    #[error(
+        "the AHardwareBuffer has only the external format {external_format:#x}, and converting \
+         it needs Vulkan 1.4 or VK_KHR_maintenance6, which this device has neither of"
+    )]
+    ConversionUnavailable {
+        /// The driver's implementation-defined format identifier.
+        external_format: u64,
+    },
+    /// The driver suggests a YCbCr model for the buffer that is not one of
+    /// the matrices a [`YcbcrEncoding`] names — such as `RGB_IDENTITY`, which
+    /// means the buffer does not hold YCbCr at all.
+    #[error(
+        "the AHardwareBuffer format {format:?} imports as YCbCr, but the driver suggests the \
+         YCbCr model {}, which names no YCbCr matrix",
+        ycbcr_model_name(*.model)
+    )]
+    UnsupportedYcbcrModel {
+        /// The buffer's own format.
+        format: HardwareBufferFormat,
+        /// The raw `VkSamplerYcbcrModelConversion` value the driver
+        /// suggested.
+        model: i32,
     },
     /// The buffer has a Vulkan format, but not one this import maps to a
     /// `wgpu` texture format.
@@ -120,9 +168,43 @@ fn vk_format_name(raw: i32) -> String {
     format!("{:?}", vk::Format::from_raw(raw))
 }
 
+fn ycbcr_model_name(raw: i32) -> String {
+    format!("{:?}", vk::SamplerYcbcrModelConversion::from_raw(raw))
+}
+
+/// A hardware buffer imported into textures on a `wgpu` device.
+#[derive(Debug)]
+pub enum ImportedHardwareBuffer {
+    /// An `Rgba8Unorm` texture that aliases an RGBA buffer, usable as
+    /// `TEXTURE_BINDING` and `COPY_SRC`. Check
+    /// [`HardwareBufferFrame::force_opaque`] before importing to know whether
+    /// its alpha is meaningful.
+    Rgba(wgpu::Texture),
+    /// The planes of a 4:2:0 YCbCr buffer.
+    Ycbcr420(Ycbcr420Planes),
+}
+
+/// The planes of a 4:2:0 YCbCr buffer, and how to turn them into R'G'B'.
+///
+/// Both views sample the stored codes: no range expansion or matrix is
+/// applied, which is left to the consumer, with [`Self::encoding`].
+#[derive(Debug)]
+pub struct Ycbcr420Planes {
+    /// The full-resolution Y' plane, sampled as `R8Unorm`.
+    pub luma: wgpu::TextureView,
+    /// The half-resolution plane of interleaved Cb/Cr pairs, sampled as
+    /// `Rg8Unorm` with Cb in red and Cr in green.
+    pub chroma: wgpu::TextureView,
+    /// The matrix and range the driver reports for the buffer.
+    pub encoding: YcbcrEncoding,
+}
+
 /// Imports Android hardware buffers into textures on one `wgpu` device.
 #[derive(Debug)]
 pub struct HardwareBufferImporter {
+    /// The external-format conversion, created by the first import that needs
+    /// it. Declared first so it is dropped while the device is still held.
+    converter: Option<Converter>,
     device: wgpu::Device,
     queue: wgpu::Queue,
 }
@@ -130,6 +212,9 @@ pub struct HardwareBufferImporter {
 impl HardwareBufferImporter {
     /// Creates an importer for `device` and the queue imports are submitted
     /// on.
+    ///
+    /// The device must have been opened with the [`DeviceRequirements`]:
+    /// through [`request_device`], or with [`DeviceRequirements::add_to`].
     ///
     /// # Panics
     ///
@@ -148,44 +233,40 @@ impl HardwareBufferImporter {
         vulkan::validate_device(&hal_device);
         drop(hal_device);
         Self {
+            converter: None,
             device: device.clone(),
             queue: queue.clone(),
         }
     }
 
-    /// Imports `frame` as a texture that aliases the buffer, and submits the
-    /// acquire of the buffer from its producer.
+    /// Imports `frame` into textures on the device, as the module-level table
+    /// describes, and submits what the import records: the acquire of the
+    /// buffer from its producer, and for an external format the conversion.
     ///
-    /// The returned texture is `TEXTURE_BINDING` (plus `COPY_SRC` for
-    /// single-plane formats), of the format in the module-level table, at the
-    /// buffer's full allocated extent. Submissions made after this returns
-    /// observe the producer's writes: the import submission waits on the
-    /// frame's acquire fence on the GPU.
+    /// Submissions made after this returns observe the producer's writes: the
+    /// import submission waits on the frame's acquire fence on the GPU, and
+    /// runs before them.
     ///
     /// # Errors
     ///
     /// Returns an error when the buffer is not GPU-sampled, protected,
-    /// layered, or of a format that has no `wgpu` equivalent — in particular an
-    /// implementation-defined external format. The frame, and with it the
-    /// lease, is dropped.
+    /// layered, of a format that has no `wgpu` equivalent, of an external
+    /// format other than 8-bit 4:2:0 YCbCr, or of a YCbCr model that names no
+    /// matrix, or when the device cannot run the conversion an external
+    /// format needs. The frame, and with it the lease, is dropped.
     ///
     /// # Panics
     ///
-    /// Panics when the buffer is multi-planar YCbCr and the device lacks
-    /// `wgpu::Features::TEXTURE_FORMAT_NV12`, when its extent or mip chain is
-    /// one `wgpu` cannot address for its format (an odd-sized or mipmapped
-    /// `NV12` buffer), or when Vulkan fails to import it.
+    /// Panics when the buffer is aliased as `NV12` and the device lacks
+    /// `wgpu::Features::TEXTURE_FORMAT_NV12`, when a YCbCr buffer is odd-sized
+    /// or mipmapped, which 4:2:0 planes cannot represent, or when Vulkan fails
+    /// to import it.
     pub fn import(
-        &self,
+        &mut self,
         frame: HardwareBufferFrame,
-    ) -> Result<wgpu::Texture, HardwareBufferImportError> {
-        let FrameParts {
-            buffer,
-            description,
-            acquire_fence,
-            mut lease,
-        } = frame.into_parts();
-        check_description(&description)?;
+    ) -> Result<ImportedHardwareBuffer, HardwareBufferImportError> {
+        let parts = frame.into_parts();
+        check_description(&parts.description)?;
         // SAFETY: `Device::as_hal` requires naming the device's real backend,
         // which `new` asserted is Vulkan, and that the raw device is not used
         // to invalidate `wgpu`'s state. It is used only to create and query
@@ -195,142 +276,74 @@ impl HardwareBufferImporter {
                 .as_hal::<wgpu::hal::api::Vulkan>()
                 .expect("AHardwareBuffer import requires a Vulkan device")
         };
-        let properties = vulkan::buffer_properties(&hal_device, buffer.buffer());
-        let layout = TextureLayout::new(&description, &properties)?;
-        let required = layout.format.required_features();
-        assert!(
-            self.device.features().contains(required),
-            "importing an AHardwareBuffer of format {:?} as {:?} requires the device feature \
-             {required:?}",
-            description.format,
-            layout.format,
-        );
-        let imported = vulkan::import_buffer(
-            &hal_device,
-            buffer.buffer(),
-            &properties,
-            &layout.image_shape(properties.format),
-            acquire_fence,
-        );
-        let image = imported.image();
-        let acquire_semaphore = imported.acquire_semaphore();
-        let raw_device = hal_device.raw_device().clone();
-        let queue_family_index = hal_device.queue_family_index();
-        if let Some(lease) = lease.as_mut() {
-            lease.presented();
-        }
-        let retirement = SyncWrapper::new(Retirement {
-            imported,
-            buffer,
-            lease,
-        });
-        let drop_callback: wgpu::hal::DropCallback =
-            Box::new(move || retirement.into_inner().retire());
-        // SAFETY: `texture_from_raw` requires an image created to match the
-        // descriptor, which it was: `image_shape` and `hal_descriptor` describe
-        // the same extent, single layer, mip count and sample count, the image
-        // has the Vulkan format `wgpu` maps the texture format to, and its
-        // usages cover the descriptor's. `view_formats` is empty; the
-        // multi-planar case is created mutable, as `wgpu` itself does for these
-        // formats. With a drop callback the image stays this module's to
-        // destroy, which the callback does through `Retirement`, and
-        // `TextureMemory::External` leaves the memory to it as well.
-        let hal_texture = unsafe {
-            hal_device.texture_from_raw(
-                image,
-                &layout.hal_descriptor(),
-                Some(drop_callback),
-                wgpu::hal::vulkan::TextureMemory::External,
-            )
-        };
-        drop(hal_device);
-        // SAFETY: `hal_texture` was created on this device from a hal
-        // descriptor that matches this one, and its memory holds the
-        // producer's contents, so it counts as initialized. It is declared to
-        // start in `RESOURCE`, which is the state the acquire barrier submitted
-        // below leaves it in before any later submission can use it.
-        let texture = unsafe {
-            self.device
-                .create_texture_from_hal::<wgpu::hal::api::Vulkan>(
-                    hal_texture,
-                    &layout.descriptor(),
-                    wgpu::TextureUses::RESOURCE,
-                )
-        };
-        self.submit_acquire(
-            &texture,
-            image,
-            &raw_device,
-            queue_family_index,
-            acquire_semaphore,
-        );
-        Ok(texture)
-    }
-
-    fn submit_acquire(
-        &self,
-        texture: &wgpu::Texture,
-        image: vk::Image,
-        raw_device: &ash::Device,
-        queue_family_index: u32,
-        acquire_semaphore: Option<vk::Semaphore>,
-    ) {
-        // `wgpu` forbids mixing raw and `wgpu` commands in one encoder, so the
-        // acquire is recorded raw into one, and a second, recorded through
-        // `wgpu`, carries the texture's use. Both go into one submission.
-        let mut acquire = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wgpu_external_frame_ahardware_buffer_acquire"),
-            });
-        // SAFETY: recording raw Vulkan into a `wgpu` encoder requires naming
-        // its real backend, which `new` asserted is Vulkan, and leaving the
-        // encoder in a state `wgpu` can finish. One pipeline barrier is
-        // recorded, outside any render pass, allocating nothing, into an
-        // encoder no `wgpu` command touches. `image` belongs to `texture`,
-        // whose retirement this submission keeps alive, as described below.
-        unsafe {
-            acquire.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|encoder| {
-                let encoder = encoder.expect("AHardwareBuffer command encoder is not Vulkan");
-                vulkan::record_acquire(raw_device, encoder, image, queue_family_index);
-            });
-        }
-        let mut track = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wgpu_external_frame_ahardware_buffer_track"),
-            });
-        // A transition to the state the texture is already in records no
-        // barrier, but it enters the texture in this submission's tracker, so
-        // `wgpu` keeps the texture — and through its drop callback the image,
-        // memory, and acquire semaphore — alive until the submission
-        // completes, even if the caller drops it at once.
-        track.transition_resources(
-            core::iter::empty(),
-            core::iter::once(wgpu::TextureTransition {
-                texture,
-                selector: None,
-                state: wgpu::TextureUses::RESOURCE,
+        let properties = vulkan::buffer_properties(&hal_device, parts.buffer.buffer());
+        match properties.format {
+            vk::Format::UNDEFINED => {
+                if parts.description.format != HardwareBufferFormat::Y8Cb8Cr8_420 {
+                    return Err(HardwareBufferImportError::ExternalFormat {
+                        format: parts.description.format,
+                        external_format: properties.external_format,
+                    });
+                }
+                let encoding = ycbcr_encoding(&parts.description, &properties)?;
+                let converter = match &mut self.converter {
+                    Some(converter) => converter,
+                    empty => empty.insert(Converter::new(&hal_device).ok_or(
+                        HardwareBufferImportError::ConversionUnavailable {
+                            external_format: properties.external_format,
+                        },
+                    )?),
+                };
+                let planes = conversion::import(
+                    &self.device,
+                    &self.queue,
+                    converter,
+                    hal_device,
+                    parts,
+                    &properties,
+                    encoding,
+                );
+                Ok(ImportedHardwareBuffer::Ycbcr420(planes))
+            }
+            vk::Format::R8G8B8A8_UNORM => {
+                let texture = alias::import(
+                    &self.device,
+                    &self.queue,
+                    hal_device,
+                    parts,
+                    &properties,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                );
+                Ok(ImportedHardwareBuffer::Rgba(texture))
+            }
+            vk::Format::G8_B8R8_2PLANE_420_UNORM => {
+                let encoding = ycbcr_encoding(&parts.description, &properties)?;
+                let texture = alias::import(
+                    &self.device,
+                    &self.queue,
+                    hal_device,
+                    parts,
+                    &properties,
+                    wgpu::TextureFormat::NV12,
+                );
+                let plane = |format, aspect| {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        format: Some(format),
+                        aspect,
+                        ..wgpu::TextureViewDescriptor::default()
+                    })
+                };
+                Ok(ImportedHardwareBuffer::Ycbcr420(Ycbcr420Planes {
+                    luma: plane(wgpu::TextureFormat::R8Unorm, wgpu::TextureAspect::Plane0),
+                    chroma: plane(wgpu::TextureFormat::Rg8Unorm, wgpu::TextureAspect::Plane1),
+                    encoding,
+                }))
+            }
+            other => Err(HardwareBufferImportError::UnsupportedFormat {
+                format: parts.description.format,
+                vulkan_format: other.as_raw(),
             }),
-        );
-        let command_buffers = [acquire.finish(), track.finish()];
-        if let Some(semaphore) = acquire_semaphore {
-            // SAFETY: `Queue::as_hal` requires naming the queue's real backend,
-            // which is the device's, Vulkan. The guard only stages a wait on
-            // the semaphore for the queue's next submission, which is the
-            // `submit` right below unless another thread submits first — in
-            // which case that earlier submission waits instead, and this one
-            // still runs after it, as `wgpu` orders submissions on its queue.
-            // The semaphore holds a pending sync-file payload and is destroyed
-            // only after this submission completes.
-            let hal_queue = unsafe {
-                self.queue
-                    .as_hal::<wgpu::hal::api::Vulkan>()
-                    .expect("AHardwareBuffer import requires a Vulkan queue")
-            };
-            hal_queue.add_wait_semaphore(semaphore, None, vk::PipelineStageFlags::ALL_COMMANDS);
         }
-        self.queue.submit(command_buffers);
     }
 }
 
@@ -356,125 +369,106 @@ const fn check_description(
     Ok(())
 }
 
-/// The `wgpu` texture a buffer imports as.
-struct TextureLayout {
-    format: wgpu::TextureFormat,
-    size: wgpu::Extent3d,
-    mip_level_count: u32,
-    usage: wgpu::TextureUsages,
+/// The encoding of a YCbCr buffer's samples, from the model and range the
+/// driver suggests for sampling it.
+fn ycbcr_encoding(
+    description: &HardwareBufferDesc,
+    properties: &BufferProperties,
+) -> Result<YcbcrEncoding, HardwareBufferImportError> {
+    let matrix = match properties.suggested_model {
+        vk::SamplerYcbcrModelConversion::YCBCR_601 => YcbcrMatrix::Bt601,
+        vk::SamplerYcbcrModelConversion::YCBCR_709 => YcbcrMatrix::Bt709,
+        vk::SamplerYcbcrModelConversion::YCBCR_2020 => YcbcrMatrix::Bt2020,
+        other => {
+            return Err(HardwareBufferImportError::UnsupportedYcbcrModel {
+                format: description.format,
+                model: other.as_raw(),
+            });
+        }
+    };
+    let range = match properties.suggested_range {
+        vk::SamplerYcbcrRange::ITU_FULL => YcbcrRange::Full,
+        vk::SamplerYcbcrRange::ITU_NARROW => YcbcrRange::Video,
+        other => panic!(
+            "the Vulkan driver suggested {other:?} as the YCbCr range of an AHardwareBuffer, \
+             which is not a VkSamplerYcbcrRange value"
+        ),
+    };
+    Ok(YcbcrEncoding { matrix, range })
 }
 
-impl TextureLayout {
-    const LABEL: Option<&'static str> = Some("wgpu_external_frame_ahardware_buffer");
-
-    fn new(
-        description: &HardwareBufferDesc,
-        properties: &vulkan::BufferProperties,
-    ) -> Result<Self, HardwareBufferImportError> {
-        let format = match properties.format {
-            vk::Format::UNDEFINED => {
-                return Err(HardwareBufferImportError::ExternalFormat {
-                    format: description.format,
-                    external_format: properties.external_format,
-                });
-            }
-            vk::Format::R8G8B8A8_UNORM => wgpu::TextureFormat::Rgba8Unorm,
-            vk::Format::G8_B8R8_2PLANE_420_UNORM => wgpu::TextureFormat::NV12,
-            other => {
-                return Err(HardwareBufferImportError::UnsupportedFormat {
-                    format: description.format,
-                    vulkan_format: other.as_raw(),
-                });
-            }
-        };
-        let size = wgpu::Extent3d {
-            width: description.width,
-            height: description.height,
-            depth_or_array_layers: 1,
-        };
-        let mip_level_count = if description
-            .usage
-            .contains(HardwareBufferUsage::GPU_MIPMAP_COMPLETE)
-        {
-            size.max_mips(wgpu::TextureDimension::D2)
-        } else {
-            1
-        };
-        let multi_planar = format.is_multi_planar_format();
-        let (width_multiple, height_multiple) = format.size_multiple_requirement();
-        assert!(
-            size.width.is_multiple_of(width_multiple)
-                && size.height.is_multiple_of(height_multiple)
-                && (!multi_planar || mip_level_count == 1),
-            "a {format:?} texture must be a single mip level whose extent is a multiple of \
-             {width_multiple}x{height_multiple}, but the AHardwareBuffer is {}x{} with \
-             {mip_level_count} levels",
-            size.width,
-            size.height,
-        );
-        // `wgpu` only samples multi-planar textures; it cannot copy their
-        // planes.
-        let usage = if multi_planar {
-            wgpu::TextureUsages::TEXTURE_BINDING
-        } else {
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC
-        };
-        Ok(Self {
-            format,
-            size,
-            mip_level_count,
-            usage,
-        })
+/// Records raw Vulkan commands into an encoder of their own.
+///
+/// `wgpu` forbids mixing raw and `wgpu` commands in one encoder, so the raw
+/// commands of an import go into this one, and [`submit`] tracks the import's
+/// textures in a second.
+///
+/// `record` must record only commands outside a render pass, or whole render
+/// passes, and leave the encoder in a state `wgpu` can finish.
+fn record_raw(
+    device: &wgpu::Device,
+    label: &'static str,
+    record: impl FnOnce(&mut wgpu::hal::vulkan::CommandEncoder),
+) -> wgpu::CommandEncoder {
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+    // SAFETY: recording raw Vulkan into a `wgpu` encoder requires naming its
+    // real backend, which the importer asserted is Vulkan, and leaving the
+    // encoder in a state `wgpu` can finish, which `record`'s contract
+    // guarantees. No `wgpu` command touches this encoder.
+    unsafe {
+        encoder.as_hal_mut::<wgpu::hal::api::Vulkan, _, _>(|encoder| {
+            record(encoder.expect("AHardwareBuffer command encoder is not Vulkan"));
+        });
     }
-
-    fn image_shape(&self, format: vk::Format) -> ImageShape {
-        let mut usage = vk::ImageUsageFlags::SAMPLED;
-        if self.usage.contains(wgpu::TextureUsages::COPY_SRC) {
-            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
-        }
-        ImageShape {
-            format,
-            width: self.size.width,
-            height: self.size.height,
-            mip_levels: self.mip_level_count,
-            multi_planar: self.format.is_multi_planar_format(),
-            usage,
-        }
-    }
-
-    fn hal_descriptor(&self) -> wgpu::hal::TextureDescriptor<'static> {
-        let mut usage = wgpu::TextureUses::RESOURCE;
-        if self.usage.contains(wgpu::TextureUsages::COPY_SRC) {
-            usage |= wgpu::TextureUses::COPY_SRC;
-        }
-        wgpu::hal::TextureDescriptor {
-            label: Self::LABEL,
-            size: self.size,
-            mip_level_count: self.mip_level_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.format,
-            usage,
-            memory_flags: wgpu::hal::MemoryFlags::empty(),
-            view_formats: Vec::new(),
-        }
-    }
-
-    const fn descriptor(&self) -> wgpu::TextureDescriptor<'static> {
-        wgpu::TextureDescriptor {
-            label: Self::LABEL,
-            size: self.size,
-            mip_level_count: self.mip_level_count,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.format,
-            usage: self.usage,
-            view_formats: &[],
-        }
-    }
+    encoder
 }
 
-/// Everything an import keeps alive for as long as `wgpu` uses its texture.
+/// Submits `raw`, an import's raw commands, with a use of each of `textures`,
+/// waiting first on the buffer's acquire semaphore.
+fn submit(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    raw: wgpu::CommandEncoder,
+    textures: &[&wgpu::Texture],
+    acquire_semaphore: Option<vk::Semaphore>,
+) {
+    let mut track = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_external_frame_ahardware_buffer_track"),
+    });
+    // A transition to the state the textures are already in records no
+    // barrier, but it enters them in this submission's tracker, so `wgpu`
+    // keeps them — and whatever their destruction releases — alive until the
+    // submission completes, even if the caller drops them at once.
+    track.transition_resources(
+        core::iter::empty(),
+        textures.iter().map(|&texture| wgpu::TextureTransition {
+            texture,
+            selector: None,
+            state: wgpu::TextureUses::RESOURCE,
+        }),
+    );
+    let command_buffers = [raw.finish(), track.finish()];
+    if let Some(semaphore) = acquire_semaphore {
+        // SAFETY: `Queue::as_hal` requires naming the queue's real backend,
+        // which is the device's, Vulkan. The guard only stages a wait on the
+        // semaphore for the queue's next submission, which is the `submit`
+        // right below unless another thread submits first — in which case
+        // that earlier submission waits instead, and this one still runs after
+        // it, as `wgpu` orders submissions on its queue. The semaphore holds a
+        // pending sync-file payload and is destroyed only after this
+        // submission completes.
+        let hal_queue = unsafe {
+            queue
+                .as_hal::<wgpu::hal::api::Vulkan>()
+                .expect("AHardwareBuffer import requires a Vulkan queue")
+        };
+        hal_queue.add_wait_semaphore(semaphore, None, vk::PipelineStageFlags::ALL_COMMANDS);
+    }
+    queue.submit(command_buffers);
+}
+
+/// Everything an import keeps alive for as long as the GPU reads its buffer.
 struct Retirement {
     imported: ImportedImage,
     buffer: BufferReference,
