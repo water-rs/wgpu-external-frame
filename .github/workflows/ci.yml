@@ -142,7 +142,7 @@ jobs:
       # where it is neither built in nor loaded.
       - name: Run the tests inside the KVM guest
         run: >-
-          timeout 900 "$HOME/.local/bin/vng"
+          timeout 900 vng
           --run "$GUEST_DIR/rootfs/boot/vmlinuz-$KVER"
           --root "$GUEST_DIR/rootfs"
           --user root
