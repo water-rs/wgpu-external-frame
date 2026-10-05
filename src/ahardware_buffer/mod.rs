@@ -34,7 +34,7 @@
 //! Both kinds of [`Ycbcr420Planes`] read the same way: a full-resolution luma
 //! plane sampled as `R8Unorm`, a half-resolution plane of interleaved Cb/Cr
 //! pairs sampled as `Rg8Unorm`, holding the stored codes, together with the
-//! [`YcbcrEncoding`](crate::YcbcrEncoding) the driver reports for the buffer.
+//! [`YcbcrEncoding`] the driver reports for the buffer.
 //! The aliased `NV12` texture needs `wgpu::Features::TEXTURE_FORMAT_NV12` on
 //! the device.
 //!

@@ -43,6 +43,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --all-targets --all-features --no-tests warn
+      # Each platform module compiles only on its own target, so rustdoc is
+      # run where the module exists: Windows here, macOS and iOS in
+      # lint-apple, Linux in lint, Android in lint-android.
+      - name: Document
+        if: runner.os == 'Windows'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features
 
   # The Linux leg runs the tests inside a KVM guest rather than on the
   # runner. The `dma_buf` tests assert the DMA-BUF import extensions, and
@@ -169,6 +177,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Document
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features
 
   # The Lint job runs on Linux, where the Apple module is compiled out, so the
   # Apple targets are linted here. The iOS targets cannot run on a hosted
@@ -190,6 +202,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo clippy --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+      - name: Document
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features --target ${{ matrix.target }}
       - name: Build the iOS test binaries
         if: matrix.target != 'aarch64-apple-darwin'
         run: cargo test --workspace --all-features --target ${{ matrix.target }} --no-run
@@ -211,6 +227,10 @@ jobs:
         with:
           tool: cargo-ndk
       - run: cargo ndk --target arm64-v8a --platform 29 clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Document
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo ndk --target arm64-v8a --platform 29 doc --workspace --no-deps --all-features
       - name: Build the Android test binaries
         run: cargo ndk --target arm64-v8a --platform 29 test --workspace --all-features --no-run
 
