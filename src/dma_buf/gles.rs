@@ -30,6 +30,8 @@ const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: c_int = 0x3444;
 
 /// The EGL and GLES entry points a DMA-BUF import needs, resolved once.
 pub(super) struct GlesInterop {
+    /// The device the import's GL calls and context locks are issued against.
+    device: wgpu::Device,
     gl: glow::Context,
     egl_get_current_display: EglGetCurrentDisplay,
     egl_create_image: EglCreateImage,
@@ -48,7 +50,21 @@ impl core::fmt::Debug for GlesInterop {
 }
 
 impl GlesInterop {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(device: &wgpu::Device) -> Self {
+        // `glow::Context::from_loader_function` below probes the context it
+        // loads from — it reads `GL_VERSION` during construction — and `wgpu`
+        // leaves its EGL context unbound outside its own calls, so
+        // construction runs under the same context lock `copy_dma_buf` and
+        // `finish` take.
+        // SAFETY: `Device::as_hal` requires the device's real backend; `new`
+        // is only reached from the importer's GLES branch, so a mismatch is
+        // `None` and panics.
+        let hal_device = unsafe {
+            device
+                .as_hal::<wgpu::hal::api::Gles>()
+                .expect("DMA-BUF import requires a GLES device")
+        };
+        let _context = hal_device.context().lock();
         // SAFETY: `Library::new` is unsafe because `dlopen` runs the library's
         // initializers, which can execute arbitrary code. These are the two
         // system EGL/GLES runtime libraries named by their versioned SONAMEs,
@@ -132,6 +148,7 @@ impl GlesInterop {
             })
         };
         Self {
+            device: device.clone(),
             gl,
             egl_get_current_display,
             egl_create_image,
@@ -142,29 +159,52 @@ impl GlesInterop {
         }
     }
 
+    /// The device's `wgpu` hal side, through which its EGL context is locked.
+    ///
+    /// `wgpu` unbinds its context after every internal call, so
+    /// `eglGetCurrentDisplay` and every GL entry point in this module would
+    /// see no current context without `AdapterContext::lock`; on drop the lock
+    /// unbinds again, which is the state `wgpu` expects to find. The lock
+    /// borrows this guard, so it has no returning helper — every caller holds
+    /// both locals.
+    fn hal_device(&self) -> impl core::ops::Deref<Target = wgpu::hal::gles::Device> {
+        // SAFETY: `Device::as_hal` requires the device's real backend; this
+        // value is reached only through the importer's GLES branch, so a
+        // mismatch is `None` and panics. The guard is only used for
+        // `context()`.
+        unsafe {
+            self.device
+                .as_hal::<wgpu::hal::api::Gles>()
+                .expect("DMA-BUF import requires a GLES device")
+        }
+    }
+
     /// Blocks until every GL command recorded so far has completed.
     pub(super) fn finish(&self) {
+        let hal_device = self.hal_device();
+        let _context = hal_device.context().lock();
         // SAFETY: every glow entry point is unsafe because it requires the GL
         // context its function pointers were loaded from to be current on this
-        // thread. `GlesInterop` is neither `Send` nor `Sync` (it holds the
-        // `libloading` handles and raw EGL pointers) and is reached here only
-        // through `&self` on the thread where wgpu's GLES device keeps its
-        // context current. `glFinish` takes no arguments, so currency is the
-        // only precondition; it is what makes a preceding copy complete before
-        // the producer is told the buffer is free.
+        // thread, which the lock above supplies until `_context` drops after
+        // the call. `glFinish` takes no arguments, so currency is the only
+        // precondition; it is what makes a preceding copy complete before the
+        // producer is told the buffer is free.
         unsafe {
             self.gl.finish();
         }
     }
 
     pub(super) fn copy_dma_buf(&self, frame: &DmaBufFrame, destination: &wgpu::Texture) {
+        let hal_device = self.hal_device();
+        let _context = hal_device.context().lock();
         // SAFETY: `egl_get_current_display` holds the address `dlsym`/
         // `eglGetProcAddress` returned for `eglGetCurrentDisplay`, whose EGL
         // signature is exactly the `EglGetCurrentDisplay` alias. It takes no
         // arguments and only reads the calling thread's EGL binding, so the
         // sole precondition is being on the thread wgpu made current — which
-        // `&self` on this non-`Send` type guarantees. A thread with no current
-        // context yields `EGL_NO_DISPLAY`, caught just below.
+        // `&self` plus the lock above guarantees the context is current. A
+        // thread with no current context yields `EGL_NO_DISPLAY`, caught just
+        // below.
         let display = unsafe { (self.egl_get_current_display)() };
         assert!(
             !display.is_null(),
@@ -239,8 +279,8 @@ impl GlesInterop {
 
         // SAFETY: every call in this block is a glow GL entry point, unsafe for
         // the one shared reason that GL requires its context to be current on
-        // the calling thread; `&self` on this non-`Send` type reaches here only
-        // on the thread where wgpu keeps the GLES context current. Beyond
+        // the calling thread, which `context_lock()` established before this
+        // method ran and keeps until it returns. Beyond
         // currency the arguments are checked rather than assumed:
         // `source_texture`, `read` and `draw` are names GL just handed back,
         // each used only between its creation and its deletion at the end of

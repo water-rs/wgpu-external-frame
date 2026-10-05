@@ -18,6 +18,12 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_TERM_COLOR: always
+  # Build dependencies shared by every Linux job, written once.
+  LINUX_DEPS: >-
+    nasm libasound2-dev libva-dev libfontconfig1-dev libgbm-dev libxcb1-dev
+    libglib2.0-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libgtk-4-dev
+    libpipewire-0.3-dev libudev-dev libegl-dev libwayland-dev libxkbcommon-dev
+    mesa-vulkan-drivers libvulkan1
 
 jobs:
   test:
@@ -26,15 +32,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y nasm libasound2-dev libva-dev libfontconfig1-dev             libgbm-dev libxcb1-dev libglib2.0-dev libpango1.0-dev libgdk-pixbuf-2.0-dev             libgtk-4-dev libpipewire-0.3-dev libudev-dev libegl-dev libwayland-dev             libxkbcommon-dev mesa-vulkan-drivers libvulkan1
       # `shaderloom` compiles WGSL to DXIL on Windows through `dxc`
       - name: Install DirectX Shader Compiler
         if: runner.os == 'Windows'
@@ -42,6 +43,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --workspace --all-targets --all-features --no-tests warn
+
+  # The Linux leg runs in a container rather than on the runner: the `dma_buf`
+  # tests assert the DMA-BUF import extensions, and the Mesa shipped with
+  # ubuntu-latest is too old to expose them — lavapipe only gained
+  # `VK_EXT_external_memory_dma_buf` in Mesa 26. Running the tests against the
+  # stock host Mesa would fail them, not skip them, so they run where the
+  # extension set exists. `/dev/udmabuf` must exist on the host before the
+  # container starts, hence the `modprobe` outside the container.
+  test-linux:
+    name: Test / ubuntu-latest
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ubuntu:26.04
+      # What the container needs on top of LINUX_DEPS: a C toolchain and curl
+      # for rustup (the GHA runner provides these, a bare image does not), and
+      # the GL runtime half of the interop — EGL and GLES on Mesa's llvmpipe.
+      CONTAINER_DEPS: >-
+        build-essential pkg-config curl ca-certificates
+        libegl1 libgles2 libgl1-mesa-dri
+    steps:
+      - uses: actions/checkout@v4
+      # The `dma_buf` tests allocate their buffers through `udmabuf`; the
+      # module ships with the kernel but is not loaded by default.
+      - name: Load the udmabuf module
+        run: sudo modprobe udmabuf
+      - name: Run the tests
+        run: |
+          docker run --rm \
+            --device /dev/udmabuf \
+            -e CARGO_TERM_COLOR \
+            -e CARGO_INCREMENTAL \
+            -e CARGO_PROFILE_DEV_DEBUG \
+            -e CARGO_PROFILE_TEST_DEBUG \
+            -e LINUX_DEPS \
+            -e CONTAINER_DEPS \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            "$IMAGE" \
+            sh -eux -c '
+              apt-get update
+              apt-get install -y --no-install-recommends $LINUX_DEPS $CONTAINER_DEPS
+              curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+              . "$HOME/.cargo/env"
+              curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/bin
+              cargo nextest run --workspace --all-targets --all-features --no-tests warn
+            '
 
   lint:
     name: Lint
@@ -54,7 +101,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm libasound2-dev libva-dev libfontconfig1-dev             libgbm-dev libxcb1-dev libglib2.0-dev libpango1.0-dev libgdk-pixbuf-2.0-dev             libgtk-4-dev libpipewire-0.3-dev libudev-dev libegl-dev libwayland-dev             libxkbcommon-dev mesa-vulkan-drivers libvulkan1
+          sudo apt-get install -y $LINUX_DEPS
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -134,7 +181,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm libasound2-dev libva-dev libfontconfig1-dev             libgbm-dev libxcb1-dev libglib2.0-dev libpango1.0-dev libgdk-pixbuf-2.0-dev             libgtk-4-dev libpipewire-0.3-dev libudev-dev libegl-dev libwayland-dev             libxkbcommon-dev mesa-vulkan-drivers libvulkan1
+          sudo apt-get install -y $LINUX_DEPS
       - uses: Swatinem/rust-cache@v2
       # Proof in the log that the floor is what compiled, so a later change to
       # the pin or the action cannot quietly make this a second stable run.

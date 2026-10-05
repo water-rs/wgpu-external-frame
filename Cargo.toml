@@ -37,6 +37,7 @@ ash = "0.38"
 glow = "0.17"
 libc = "0.2"
 libloading = "0.9"
+sync_wrapper = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 ash = "0.38"
@@ -47,6 +48,9 @@ thiserror = "2"
 [target.'cfg(target_os = "android")'.dev-dependencies]
 ash = "0.38"
 ndk = { version = "0.9", default-features = false, features = ["api-level-29"] }
+pollster = "1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 pollster = "1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
