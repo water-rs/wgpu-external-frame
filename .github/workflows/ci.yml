@@ -59,6 +59,30 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # The Lint job runs on Linux, where the Apple module is compiled out, so the
+  # Apple targets are linted here. The iOS targets cannot run on a hosted
+  # runner, so their test binaries are built and linked rather than run.
+  lint-apple:
+    name: Lint / ${{ matrix.target }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo clippy --workspace --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+      - name: Build the iOS test binaries
+        if: matrix.target != 'aarch64-apple-darwin'
+        run: cargo test --workspace --all-features --target ${{ matrix.target }} --no-run
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
