@@ -64,10 +64,14 @@ jobs:
         libegl1 libgles2 libgl1-mesa-dri
     steps:
       - uses: actions/checkout@v4
-      # The `dma_buf` tests allocate their buffers through `udmabuf`; the
-      # module ships with the kernel but is not loaded by default.
+      # The `dma_buf` tests allocate their buffers through `udmabuf`. The
+      # runner's Azure kernel carries the module only in its
+      # `linux-modules-extra` package, and does not load it by default.
       - name: Load the udmabuf module
-        run: sudo modprobe udmabuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          sudo modprobe udmabuf
       - name: Run the tests
         run: |
           docker run --rm \
