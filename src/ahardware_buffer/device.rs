@@ -2,7 +2,7 @@ use std::ffi::CStr;
 
 use ash::vk;
 
-/// The Vulkan device extensions an `AHardwareBuffer` import needs.
+/// The Vulkan device extensions every `AHardwareBuffer` import needs.
 ///
 /// `wgpu` enables none of them on its own, so a device that imports hardware
 /// buffers must be opened with them, together with the feature
@@ -17,50 +17,106 @@ use ash::vk;
 ///   transfer every import performs.
 /// - `VK_KHR_external_semaphore_fd` turns the producer's acquire fence into a
 ///   semaphore the GPU waits on.
-/// - `VK_KHR_push_descriptor` binds the sampler of the external-format YCbCr
-///   conversion. Vulkan 1.4 made push descriptors core, but `wgpu-hal`
-///   creates its instance for Vulkan 1.3 at most, and a device may only use
-///   core functionality up to that version, so the extension is the only way
-///   a `wgpu` device has to push descriptors.
 ///
-/// The remaining dependencies of these extensions are core in Vulkan 1.1,
-/// which [`request_device`] requires.
-pub const DEVICE_EXTENSIONS: [&CStr; 4] = [
+/// The external-format conversion additionally needs
+/// [`CONVERSION_DEVICE_EXTENSIONS`], which are enabled where the adapter
+/// offers them. The remaining dependencies of all these extensions are core in
+/// Vulkan 1.1, which [`DeviceRequirements::new`] requires.
+pub const DEVICE_EXTENSIONS: [&CStr; 3] = [
     ash::android::external_memory_android_hardware_buffer::NAME,
     ash::ext::queue_family_foreign::NAME,
     ash::khr::external_semaphore_fd::NAME,
-    ash::khr::push_descriptor::NAME,
 ];
 
-/// What an `AHardwareBuffer` import needs of a Vulkan device beyond `wgpu`.
+/// The Vulkan device extensions the external-format YCbCr conversion needs
+/// beyond [`DEVICE_EXTENSIONS`].
+///
+/// [`DeviceRequirements`] enables them when the adapter offers them and opens
+/// the device without them otherwise. A device opened without them imports
+/// every buffer except one the driver describes only through an external
+/// format, which it rejects with
+/// [`HardwareBufferImportError::ConversionUnavailable`](super::HardwareBufferImportError::ConversionUnavailable).
+///
+/// - `VK_KHR_push_descriptor` binds the buffer to the conversion's sampler.
+///   Vulkan 1.4 made push descriptors core, but `wgpu-hal` creates its
+///   instance for Vulkan 1.3 at most, and a device may only use core
+///   functionality up to that version, so the extension is the only way a
+///   `wgpu` device has to push descriptors.
+pub const CONVERSION_DEVICE_EXTENSIONS: [&CStr; 1] = [ash::khr::push_descriptor::NAME];
+
+/// What an `AHardwareBuffer` import needs of a Vulkan device beyond `wgpu`,
+/// checked against one adapter.
 ///
 /// That is the [`DEVICE_EXTENSIONS`] and the `samplerYcbcrConversion`
-/// feature, with which external-format YCbCr buffers are converted; `wgpu`
+/// feature, with which external-format YCbCr buffers are converted, and the
+/// [`CONVERSION_DEVICE_EXTENSIONS`] where the adapter offers them; `wgpu`
 /// enables none of them on its own.
 ///
 /// [`request_device`] applies them. A renderer that opens its device itself
-/// through `wgpu::hal::vulkan::Adapter::open_with_callback` keeps a value of
-/// this type alive across the call and passes the callback's arguments to
-/// [`Self::add_to`].
-#[derive(Debug, Default)]
+/// through `wgpu::hal::vulkan::Adapter::open_with_callback` creates a value
+/// of this type with [`Self::new`] for the adapter, keeps it alive across the
+/// call, and passes the callback's arguments to [`Self::add_to`].
+#[derive(Debug)]
 pub struct DeviceRequirements {
     sampler_ycbcr_conversion: vk::PhysicalDeviceSamplerYcbcrConversionFeatures<'static>,
+    /// Whether the adapter offers every one of
+    /// [`CONVERSION_DEVICE_EXTENSIONS`].
+    conversion_extensions: bool,
 }
 
 impl DeviceRequirements {
-    /// Adds the extensions and features to a device being opened, from inside
+    /// Checks that `adapter` can import hardware buffers, and records whether
+    /// it offers the [`CONVERSION_DEVICE_EXTENSIONS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the adapter cannot provide Vulkan 1.1, one of the
+    /// [`DEVICE_EXTENSIONS`], or the `samplerYcbcrConversion` feature. The
+    /// absence of a conversion extension is not an error.
+    pub fn new(adapter: &wgpu::hal::vulkan::Adapter) -> Result<Self, DeviceRequestError> {
+        let capabilities = adapter.physical_device_capabilities();
+        let api_version = capabilities.properties().api_version;
+        if api_version < vk::API_VERSION_1_1 {
+            return Err(DeviceRequestError::VulkanVersion {
+                major: vk::api_version_major(api_version),
+                minor: vk::api_version_minor(api_version),
+            });
+        }
+        if let Some(missing) = DEVICE_EXTENSIONS
+            .into_iter()
+            .find(|extension| !capabilities.supports_extension(extension))
+        {
+            return Err(DeviceRequestError::MissingExtension(missing));
+        }
+        if !supports_sampler_ycbcr_conversion(adapter) {
+            return Err(DeviceRequestError::MissingFeature("samplerYcbcrConversion"));
+        }
+        Ok(Self {
+            sampler_ycbcr_conversion: vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default(),
+            conversion_extensions: CONVERSION_DEVICE_EXTENSIONS
+                .into_iter()
+                .all(|extension| capabilities.supports_extension(extension)),
+        })
+    }
+
+    /// Adds the extensions and features to a device being opened on the
+    /// adapter this value was created for, from inside
     /// `open_with_callback`'s callback.
     ///
     /// The feature is chained into `arguments.create_info` as a
     /// `VkPhysicalDeviceSamplerYcbcrConversionFeatures`, so the callback must
     /// not also chain that structure or `VkPhysicalDeviceVulkan11Features`,
-    /// and must call this once per device. The adapter must support every
-    /// extension and the feature, which [`request_device`] checks.
+    /// and must call this once per device.
     pub fn add_to<'pnext>(
         &'pnext mut self,
         arguments: &mut wgpu::hal::vulkan::CreateDeviceCallbackArgs<'_, 'pnext, '_>,
     ) {
-        for extension in DEVICE_EXTENSIONS {
+        let conversion: &[&'static CStr] = if self.conversion_extensions {
+            &CONVERSION_DEVICE_EXTENSIONS
+        } else {
+            &[]
+        };
+        for &extension in DEVICE_EXTENSIONS.iter().chain(conversion) {
             if !arguments.extensions.contains(&extension) {
                 arguments.extensions.push(extension);
             }
@@ -72,7 +128,8 @@ impl DeviceRequirements {
     }
 }
 
-/// Why [`request_device`] could not open a device.
+/// Why [`request_device`] could not open a device, or
+/// [`DeviceRequirements::new`] rejected an adapter.
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceRequestError {
     /// The adapter is not a Vulkan 1.1 device, which the hardware-buffer
@@ -134,8 +191,11 @@ pub enum DeviceRequestError {
 /// # Errors
 ///
 /// Returns an error when the adapter cannot provide Vulkan 1.1, one of the
-/// extensions, the `samplerYcbcrConversion` feature, or the requested
-/// features and limits, or when device creation fails.
+/// [`DEVICE_EXTENSIONS`], the `samplerYcbcrConversion` feature, or the
+/// requested features and limits, or when device creation fails. An adapter
+/// without the [`CONVERSION_DEVICE_EXTENSIONS`] is not an error: the device is
+/// opened without them, and rejects only the buffers that need the
+/// conversion.
 ///
 /// # Panics
 ///
@@ -154,30 +214,14 @@ pub fn request_device(
             .as_hal::<wgpu::hal::api::Vulkan>()
             .expect("AHardwareBuffer import requires a Vulkan adapter")
     };
-    let capabilities = hal_adapter.physical_device_capabilities();
-    let api_version = capabilities.properties().api_version;
-    if api_version < vk::API_VERSION_1_1 {
-        return Err(DeviceRequestError::VulkanVersion {
-            major: vk::api_version_major(api_version),
-            minor: vk::api_version_minor(api_version),
-        });
-    }
-    if let Some(missing) = DEVICE_EXTENSIONS
-        .into_iter()
-        .find(|extension| !capabilities.supports_extension(extension))
-    {
-        return Err(DeviceRequestError::MissingExtension(missing));
-    }
-    if !supports_sampler_ycbcr_conversion(&hal_adapter) {
-        return Err(DeviceRequestError::MissingFeature("samplerYcbcrConversion"));
-    }
-    let mut requirements = DeviceRequirements::default();
+    let mut requirements = DeviceRequirements::new(&hal_adapter)?;
     // SAFETY: `open_with_callback` has `Adapter::open`'s contract — features
     // and limits the adapter supports — plus the callback's: it may only add
     // what the device supports and must not remove anything.
     // `check_descriptor` verified the features and limits against this
-    // adapter. The callback only appends extensions that were just checked
-    // with `supports_extension`, skipping any `wgpu` already enabled, and
+    // adapter. The callback only appends extensions that
+    // `DeviceRequirements::new` checked with `supports_extension`, skipping
+    // any `wgpu` already enabled, and
     // chains the YCbCr conversion feature just checked as supported, which
     // `wgpu-hal` itself never chains. The extensions' dependencies are core in
     // the Vulkan 1.1 the device was checked to have. `requirements` outlives

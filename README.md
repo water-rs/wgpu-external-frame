@@ -10,7 +10,7 @@ turns each of those handles into a `wgpu::Texture` on a device you already own:
 | Platform | Handle | Import path |
 | --- | --- | --- |
 | Linux | DMA-BUF file descriptor | Vulkan `VK_EXT_external_memory_dma_buf`, or EGL `EGL_LINUX_DMA_BUF_EXT` + `glEGLImageTargetTexture2DOES` |
-| Android | `AHardwareBuffer` | Vulkan `VK_ANDROID_external_memory_android_hardware_buffer` |
+| Android | `AHardwareBuffer` | Vulkan `VK_ANDROID_external_memory_android_hardware_buffer`; buffers of an external format are converted through `VK_KHR_push_descriptor` |
 | macOS, iOS | `IOSurface` | `MTLDevice newTextureWithDescriptor:iosurface:plane:`, one texture per plane |
 | Windows | Shared texture `HANDLE` | `ID3D12Device::OpenSharedHandle` |
 
@@ -37,7 +37,12 @@ range the Vulkan driver reports for it:
 
 The device must be opened with the extensions and the YCbCr conversion feature
 the import needs, which `wgpu` does not enable on its own;
-`ahardware_buffer::request_device` does that. Building for Android compiles the
+`ahardware_buffer::request_device` does that. The conversion also needs
+`VK_KHR_push_descriptor`, which `request_device` enables when the adapter
+offers it. A device without it imports RGBA buffers and buffers the driver maps
+to `NV12` as usual, and rejects a buffer that needs the conversion with
+`HardwareBufferImportError::ConversionUnavailable`, which names the missing
+extension. Building for Android compiles the
 conversion's GLSL shaders with the NDK's `glslc`, found through
 `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT`.
 

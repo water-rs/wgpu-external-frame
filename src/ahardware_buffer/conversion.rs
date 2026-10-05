@@ -16,6 +16,7 @@
 
 use core::ops::Deref;
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -262,6 +263,36 @@ struct ConversionKey {
     y_chroma_offset: vk::ChromaLocation,
 }
 
+/// The external-format conversion of a device opened with the
+/// [`CONVERSION_DEVICE_EXTENSIONS`](super::CONVERSION_DEVICE_EXTENSIONS).
+///
+/// Its [`Converter`] is created by the first import that needs it, and only
+/// through this type, so no conversion runs on a device without the
+/// extensions.
+#[derive(Debug)]
+pub(super) struct Conversion {
+    converter: Option<Converter>,
+}
+
+impl Conversion {
+    /// The conversion of `hal_device`, or the first of the conversion
+    /// extensions the device was opened without.
+    pub(super) fn of(hal_device: &wgpu::hal::vulkan::Device) -> Result<Self, &'static CStr> {
+        super::CONVERSION_DEVICE_EXTENSIONS
+            .into_iter()
+            .find(|extension| !hal_device.enabled_device_extensions().contains(extension))
+            .map_or(Ok(Self { converter: None }), Err)
+    }
+
+    /// The converter, created on first use.
+    ///
+    /// `hal_device` must be the device this conversion was created for.
+    pub(super) fn converter(&mut self, hal_device: &wgpu::hal::vulkan::Device) -> &mut Converter {
+        self.converter
+            .get_or_insert_with(|| Converter::new(hal_device))
+    }
+}
+
 /// Converts external-format buffers on one device, caching a pipeline per
 /// set of conversion parameters.
 pub(super) struct Converter {
@@ -282,8 +313,10 @@ impl Converter {
     /// Creates the device-wide objects of the conversion.
     ///
     /// `hal_device` must enable every one of [`super::DEVICE_EXTENSIONS`],
-    /// which `HardwareBufferImporter::new` asserts.
-    pub(super) fn new(hal_device: &wgpu::hal::vulkan::Device) -> Self {
+    /// which `HardwareBufferImporter::new` asserts, and of
+    /// [`super::CONVERSION_DEVICE_EXTENSIONS`], which [`Conversion::of`]
+    /// checked.
+    fn new(hal_device: &wgpu::hal::vulkan::Device) -> Self {
         Self {
             shared: Arc::new(Shared::new(
                 hal_device.shared_instance().raw_instance(),
@@ -525,7 +558,8 @@ impl ConversionPipeline {
         // SAFETY: a YCbCr conversion sampler must be bound as an immutable
         // sampler of a combined image sampler, which this one binding is; the
         // sampler was created on `device` just above. The push-descriptor flag
-        // needs `VK_KHR_push_descriptor`, which the device enables, and is
+        // needs `VK_KHR_push_descriptor`, which `Conversion::of` checked the
+        // device enables, and is
         // valid for this binding as the comment above sets out.
         let set_layout = unsafe { device.create_descriptor_set_layout(&set_layout_info, None) }
             .unwrap_or_else(|error| {
