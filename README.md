@@ -19,7 +19,11 @@ Each platform is its own module with its own frame types — `DmaBufFrame`,
 `SharedHandleFrame` — because the handles have nothing in common beyond the
 goal. The Linux and Android sides additionally model the producer's *lease* on
 the buffer (`DmaBufLease`, `HardwareBufferLease`), since those buffers usually
-come from a pool the producer needs back, guarded by an explicit fence.
+come from a pool the producer needs back, guarded by an explicit fence. An
+`IOSurface` frame takes the object its producer recycles, such as a pooled
+`CVPixelBuffer`, as its *owner* (`with_owner`), and drops it once the frame and
+every texture imported from it have been destroyed, which `wgpu` does only
+after every submission that used them has completed.
 
 On Android an RGBA buffer imports as an `Rgba8Unorm` texture that aliases the
 buffer itself, so nothing is copied. A 4:2:0 YCbCr buffer imports as two plane

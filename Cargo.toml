@@ -66,6 +66,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLTexture",
     "objc2-io-surface",
 ] }
+sync_wrapper = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
