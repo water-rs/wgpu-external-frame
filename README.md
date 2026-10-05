@@ -10,15 +10,25 @@ turns each of those handles into a `wgpu::Texture` on a device you already own:
 | Platform | Handle | Import path |
 | --- | --- | --- |
 | Linux | DMA-BUF file descriptor | Vulkan `VK_EXT_external_memory_dma_buf`, or EGL `EGL_LINUX_DMA_BUF_EXT` + `glEGLImageTargetTexture2DOES` |
+| Android | `AHardwareBuffer` | Vulkan `VK_ANDROID_external_memory_android_hardware_buffer` |
 | macOS, iOS | `IOSurface` | `MTLDevice newTextureWithDescriptor:iosurface:plane:`, one texture per plane |
 | Windows | Shared texture `HANDLE` | `ID3D12Device::OpenSharedHandle` |
 
 Each platform is its own module with its own frame types — `DmaBufFrame`,
-`PackedIoSurfaceFrame` and `Ycbcr420IoSurfaceFrame`, `SharedHandleFrame` —
-because the handles have nothing in common beyond the goal. The Linux side
-additionally models the producer's *lease* on the buffer (`DmaBufLease`), since
-a DMA-BUF usually comes from a pool the producer needs back, guarded by an
-explicit rendering fence.
+`HardwareBufferFrame`, `PackedIoSurfaceFrame` and `Ycbcr420IoSurfaceFrame`,
+`SharedHandleFrame` — because the handles have nothing in common beyond the
+goal. The Linux and Android sides additionally model the producer's *lease* on
+the buffer (`DmaBufLease`, `HardwareBufferLease`), since those buffers usually
+come from a pool the producer needs back, guarded by an explicit fence.
+
+On Android the imported texture aliases the buffer itself, so nothing is
+copied. RGBA buffers import as `Rgba8Unorm`, and 4:2:0 YCbCr buffers that the
+Vulkan driver maps to `G8_B8R8_2PLANE_420_UNORM` import as `NV12`, read through
+plane views. A buffer the driver describes only with an implementation-defined
+external format is rejected: sampling it needs a `VkSamplerYcbcrConversion`,
+which `wgpu` cannot express. The device must be opened with the extensions the
+import needs, which `wgpu` does not enable on its own;
+`ahardware_buffer::request_device` does that.
 
 On Apple platforms, camera and video frames are biplanar 4:2:0 YCbCr surfaces,
 and each of their planes imports as its own texture at that plane's extent:
