@@ -2,9 +2,9 @@
 //!
 //! Each test allocates a hardware buffer, writes a known pattern into it from
 //! the CPU, imports it, and reads it back through a compute shader that samples
-//! the imported texture, so what is compared is what the GPU sees. One test
-//! hands the import a sync file a GPU submission signals, standing in for a
-//! producer's acquire fence.
+//! the imported texture or planes, so what is compared is what the GPU sees.
+//! One test hands the import a sync file a GPU submission signals, standing in
+//! for a producer's acquire fence.
 #![cfg(target_os = "android")]
 
 use std::os::fd::{FromRawFd as _, OwnedFd};
@@ -17,7 +17,7 @@ use ndk::hardware_buffer::HardwareBufferRef;
 use wgpu_external_frame::ahardware_buffer::{
     HardwareBuffer, HardwareBufferDesc, HardwareBufferFormat, HardwareBufferFrame,
     HardwareBufferImportError, HardwareBufferImporter, HardwareBufferLease, HardwareBufferUsage,
-    request_device,
+    ImportedHardwareBuffer, Ycbcr420Planes, request_device,
 };
 
 const WIDTH: u32 = 64;
@@ -328,16 +328,90 @@ fn expected_rgba() -> Vec<u32> {
         .collect()
 }
 
+/// Writes [`luma`] and [`chroma`] into every sample of a `Y8Cb8Cr8_420`
+/// buffer through its CPU-locked planes and unlocks it synchronously.
+fn write_ycbcr(buffer: &HardwareBuffer) {
+    let planes: Vec<_> = buffer
+        .lock_planes(HardwareBufferUsage::CPU_WRITE_OFTEN, None, None)
+        .expect("failed to lock the YCbCr buffer's planes")
+        .collect();
+    assert_eq!(
+        planes.len(),
+        3,
+        "a YCbCr buffer locks as Y, Cb and Cr planes"
+    );
+    let write = |plane: usize, x: u32, y: u32, value: u8| {
+        let plane = planes[plane];
+        let offset = usize::try_from(y * plane.bytes_per_stride + x * plane.bytes_per_pixel)
+            .expect("fits usize");
+        // SAFETY: `lock_planes` maps each plane with the row and pixel strides
+        // it reports, and every caller stays within that plane's extent — the
+        // full extent for Y, half of it in each direction for Cb and Cr — so
+        // the byte written lies inside the mapping, valid until the unlock.
+        unsafe { plane.virtual_address.cast::<u8>().add(offset).write(value) };
+    };
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            write(0, x, y, luma(x, y));
+        }
+    }
+    for y in 0..HEIGHT / 2 {
+        for x in 0..WIDTH / 2 {
+            let (cb, cr) = chroma(x, y);
+            write(1, x, y, cb);
+            write(2, x, y, cr);
+        }
+    }
+    buffer.unlock().expect("failed to unlock the YCbCr buffer");
+}
+
+fn expected_luma() -> Vec<u32> {
+    (0..HEIGHT)
+        .flat_map(|y| (0..WIDTH).map(move |x| pack([luma(x, y), 0, 0, 255])))
+        .collect()
+}
+
+fn expected_chroma() -> Vec<u32> {
+    (0..HEIGHT / 2)
+        .flat_map(|y| {
+            (0..WIDTH / 2).map(move |x| {
+                let (cb, cr) = chroma(x, y);
+                pack([cb, cr, 0, 255])
+            })
+        })
+        .collect()
+}
+
+fn read_planes(gpu: &Gpu, planes: &Ycbcr420Planes) {
+    assert_eq!(planes.luma.texture().width(), WIDTH);
+    assert_eq!(planes.luma.texture().height(), HEIGHT);
+    // The conversion samples with the identity model and nearest filtering,
+    // so every code must survive exactly: the tolerance is zero.
+    assert_eq!(
+        gpu.read_texels(&planes.luma, WIDTH, HEIGHT),
+        expected_luma(),
+        "luma plane"
+    );
+    assert_eq!(
+        gpu.read_texels(&planes.chroma, WIDTH / 2, HEIGHT / 2),
+        expected_chroma(),
+        "chroma plane"
+    );
+}
+
 #[test]
 fn rgba_buffer_imports_with_its_texels() {
-    let gpu = Gpu::new();
+    let mut gpu = Gpu::new();
     let buffer = allocate(HardwareBufferFormat::R8G8B8A8_UNORM);
     write_rgba(&buffer);
     let (events, received) = mpsc::channel();
-    let texture = gpu
+    let ImportedHardwareBuffer::Rgba(texture) = gpu
         .importer
         .import(frame(&buffer, None, RecordingLease(events)))
-        .expect("an RGBA buffer imports");
+        .expect("an RGBA buffer imports")
+    else {
+        panic!("an RGBA buffer imports as an RGBA texture");
+    };
     assert_eq!(texture.format(), wgpu::TextureFormat::Rgba8Unorm);
     assert_eq!(received.try_recv(), Ok(LeaseEvent::Presented));
 
@@ -357,6 +431,47 @@ fn rgba_buffer_imports_with_its_texels() {
     drop(texture);
     gpu.wait();
     assert_eq!(received.try_recv(), Ok(LeaseEvent::Released));
+}
+
+/// A `Y8Cb8Cr8_420` buffer imports as planes holding the codes the CPU wrote,
+/// whichever way the driver describes it: as `NV12`, which the planes alias,
+/// or — as the Mali-G715 driver does — as an external format, which the import
+/// converts on the GPU.
+#[test]
+fn ycbcr_420_buffer_imports_as_planes_with_its_codes() {
+    let mut gpu = Gpu::new();
+    let buffer = allocate(HardwareBufferFormat::Y8Cb8Cr8_420);
+    write_ycbcr(&buffer);
+    let (events, received) = mpsc::channel();
+    let ImportedHardwareBuffer::Ycbcr420(planes) = gpu
+        .importer
+        .import(frame(&buffer, None, RecordingLease(events)))
+        .expect("a Y8Cb8Cr8_420 buffer imports")
+    else {
+        panic!("a Y8Cb8Cr8_420 buffer imports as YCbCr planes");
+    };
+    assert_eq!(received.try_recv(), Ok(LeaseEvent::Presented));
+    let converted = planes.luma.texture().format() == wgpu::TextureFormat::R8Unorm;
+    if converted {
+        // Nothing reads the buffer once the conversion has completed, so the
+        // lease comes back while the planes are still alive.
+        gpu.wait();
+        assert_eq!(received.try_recv(), Ok(LeaseEvent::Released));
+        assert_eq!(
+            planes.chroma.texture().format(),
+            wgpu::TextureFormat::Rg8Unorm
+        );
+    } else {
+        assert_eq!(planes.luma.texture().format(), wgpu::TextureFormat::NV12);
+    }
+    read_planes(&gpu, &planes);
+
+    drop(planes);
+    gpu.wait();
+    if !converted {
+        assert_eq!(received.try_recv(), Ok(LeaseEvent::Released));
+    }
+    assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Disconnected));
 }
 
 /// A binary semaphore the GPU signals after a long compute dispatch, exported
@@ -420,25 +535,48 @@ impl Drop for ProducerFence {
 }
 
 /// The import takes a sync file that is still pending and turns it into the
-/// semaphore its submission waits on. `wgpu` orders submissions on one queue,
-/// so this proves the fence is consumed and the import completes with the
-/// right contents, not that the wait alone orders the two.
+/// semaphore its submission waits on, for an aliased RGBA buffer and for a
+/// YCbCr buffer, which the device may convert. `wgpu` orders submissions on
+/// one queue, so this proves the fence is consumed and the import completes
+/// with the right contents, not that the wait alone orders the two.
 #[test]
 fn import_consumes_a_pending_acquire_fence() {
-    let gpu = Gpu::new();
-    let buffer = allocate(HardwareBufferFormat::R8G8B8A8_UNORM);
-    write_rgba(&buffer);
+    let mut gpu = Gpu::new();
+    let rgba = allocate(HardwareBufferFormat::R8G8B8A8_UNORM);
+    write_rgba(&rgba);
     let (producer, fence) = ProducerFence::signal(&gpu);
     let (events, received) = mpsc::channel();
-    let texture = gpu
+    let ImportedHardwareBuffer::Rgba(texture) = gpu
         .importer
-        .import(frame(&buffer, Some(fence), RecordingLease(events)))
-        .expect("an RGBA buffer imports with an acquire fence");
+        .import(frame(&rgba, Some(fence), RecordingLease(events)))
+        .expect("an RGBA buffer imports with an acquire fence")
+    else {
+        panic!("an RGBA buffer imports as an RGBA texture");
+    };
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     assert_eq!(gpu.read_texels(&view, WIDTH, HEIGHT), expected_rgba());
-
     drop(view);
     drop(texture);
+    gpu.wait();
+    drop(producer);
+    assert_eq!(
+        received.try_iter().collect::<Vec<_>>(),
+        [LeaseEvent::Presented, LeaseEvent::Released]
+    );
+
+    let ycbcr = allocate(HardwareBufferFormat::Y8Cb8Cr8_420);
+    write_ycbcr(&ycbcr);
+    let (producer, fence) = ProducerFence::signal(&gpu);
+    let (events, received) = mpsc::channel();
+    let ImportedHardwareBuffer::Ycbcr420(planes) = gpu
+        .importer
+        .import(frame(&ycbcr, Some(fence), RecordingLease(events)))
+        .expect("a Y8Cb8Cr8_420 buffer imports with an acquire fence")
+    else {
+        panic!("a Y8Cb8Cr8_420 buffer imports as YCbCr planes");
+    };
+    read_planes(&gpu, &planes);
+    drop(planes);
     gpu.wait();
     drop(producer);
     assert_eq!(
@@ -448,109 +586,8 @@ fn import_consumes_a_pending_acquire_fence() {
 }
 
 #[test]
-fn ycbcr_420_buffer_imports_as_nv12_or_reports_its_external_format() {
-    let gpu = Gpu::new();
-    let buffer = allocate(HardwareBufferFormat::Y8Cb8Cr8_420);
-    let planes: Vec<_> = buffer
-        .lock_planes(HardwareBufferUsage::CPU_WRITE_OFTEN, None, None)
-        .expect("failed to lock the YCbCr buffer's planes")
-        .collect();
-    assert_eq!(
-        planes.len(),
-        3,
-        "a YCbCr buffer locks as Y, Cb and Cr planes"
-    );
-    let write = |plane: usize, x: u32, y: u32, value: u8| {
-        let plane = planes[plane];
-        let offset = usize::try_from(y * plane.bytes_per_stride + x * plane.bytes_per_pixel)
-            .expect("fits usize");
-        // SAFETY: `lock_planes` maps each plane with the row and pixel strides
-        // it reports, and every caller stays within that plane's extent — the
-        // full extent for Y, half of it in each direction for Cb and Cr — so
-        // the byte written lies inside the mapping, valid until the unlock.
-        unsafe { plane.virtual_address.cast::<u8>().add(offset).write(value) };
-    };
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            write(0, x, y, luma(x, y));
-        }
-    }
-    for y in 0..HEIGHT / 2 {
-        for x in 0..WIDTH / 2 {
-            let (cb, cr) = chroma(x, y);
-            write(1, x, y, cb);
-            write(2, x, y, cr);
-        }
-    }
-    buffer.unlock().expect("failed to unlock the YCbCr buffer");
-    let (events, received) = mpsc::channel();
-    let texture = match gpu
-        .importer
-        .import(frame(&buffer, None, RecordingLease(events)))
-    {
-        Ok(texture) => texture,
-        Err(
-            error @ HardwareBufferImportError::ExternalFormat {
-                format,
-                external_format,
-            },
-        ) => {
-            assert_eq!(format, HardwareBufferFormat::Y8Cb8Cr8_420);
-            assert_ne!(external_format, 0, "Vulkan external formats are never zero");
-            assert!(
-                error.to_string().contains("Y8Cb8Cr8_420"),
-                "the rejection names the format: {error}"
-            );
-            assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Disconnected));
-            return;
-        }
-        Err(error) => panic!("unexpected rejection of a Y8Cb8Cr8_420 buffer: {error}"),
-    };
-    assert_eq!(texture.format(), wgpu::TextureFormat::NV12);
-    assert_eq!(received.try_recv(), Ok(LeaseEvent::Presented));
-
-    let luma_view = texture.create_view(&wgpu::TextureViewDescriptor {
-        format: Some(wgpu::TextureFormat::R8Unorm),
-        aspect: wgpu::TextureAspect::Plane0,
-        ..wgpu::TextureViewDescriptor::default()
-    });
-    let chroma_view = texture.create_view(&wgpu::TextureViewDescriptor {
-        format: Some(wgpu::TextureFormat::Rg8Unorm),
-        aspect: wgpu::TextureAspect::Plane1,
-        ..wgpu::TextureViewDescriptor::default()
-    });
-    let expected_luma: Vec<u32> = (0..HEIGHT)
-        .flat_map(|y| (0..WIDTH).map(move |x| pack([luma(x, y), 0, 0, 255])))
-        .collect();
-    let expected_chroma: Vec<u32> = (0..HEIGHT / 2)
-        .flat_map(|y| {
-            (0..WIDTH / 2).map(move |x| {
-                let (cb, cr) = chroma(x, y);
-                pack([cb, cr, 0, 255])
-            })
-        })
-        .collect();
-    assert_eq!(
-        gpu.read_texels(&luma_view, WIDTH, HEIGHT),
-        expected_luma,
-        "luma plane"
-    );
-    assert_eq!(
-        gpu.read_texels(&chroma_view, WIDTH / 2, HEIGHT / 2),
-        expected_chroma,
-        "chroma plane"
-    );
-
-    drop(luma_view);
-    drop(chroma_view);
-    drop(texture);
-    gpu.wait();
-    assert_eq!(received.try_recv(), Ok(LeaseEvent::Released));
-}
-
-#[test]
 fn rejected_buffer_drops_its_lease() {
-    let gpu = Gpu::new();
+    let mut gpu = Gpu::new();
     let buffer = HardwareBuffer::allocate(HardwareBufferDesc {
         width: WIDTH,
         height: HEIGHT,
@@ -570,5 +607,34 @@ fn rejected_buffer_drops_its_lease() {
         "unexpected rejection: {error}"
     );
     // The lease was dropped with the frame, never presented or released.
+    assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+}
+
+/// A 10-bit buffer the driver describes only through an external format is
+/// rejected rather than converted into 8-bit planes, which would drop
+/// precision. A driver that maps `YCbCr_P010` to a Vulkan format rejects it as
+/// unsupported instead.
+#[test]
+fn external_format_other_than_8_bit_ycbcr_is_rejected() {
+    let mut gpu = Gpu::new();
+    let buffer = allocate(HardwareBufferFormat::YCbCr_P010);
+    let (events, received) = mpsc::channel();
+    let error = gpu
+        .importer
+        .import(frame(&buffer, None, RecordingLease(events)))
+        .expect_err("a YCbCr_P010 buffer is rejected");
+    match error {
+        HardwareBufferImportError::ExternalFormat {
+            format,
+            external_format,
+        } => {
+            assert_eq!(format, HardwareBufferFormat::YCbCr_P010);
+            assert_ne!(external_format, 0, "Vulkan external formats are never zero");
+        }
+        HardwareBufferImportError::UnsupportedFormat { format, .. } => {
+            assert_eq!(format, HardwareBufferFormat::YCbCr_P010);
+        }
+        other => panic!("unexpected rejection of a YCbCr_P010 buffer: {other}"),
+    }
     assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Disconnected));
 }

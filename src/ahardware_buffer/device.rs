@@ -5,9 +5,11 @@ use ash::vk;
 /// The Vulkan device extensions an `AHardwareBuffer` import needs.
 ///
 /// `wgpu` enables none of them on its own, so a device that imports hardware
-/// buffers must be opened with them: through [`request_device`], or by adding
-/// them in the callback of `wgpu::hal::vulkan::Adapter::open_with_callback`
-/// for a renderer that opens its device itself.
+/// buffers must be opened with them, together with the feature
+/// [`DeviceRequirements`] names: through [`request_device`], or with
+/// [`DeviceRequirements::add_to`] in the callback of
+/// `wgpu::hal::vulkan::Adapter::open_with_callback` for a renderer that opens
+/// its device itself.
 ///
 /// - `VK_ANDROID_external_memory_android_hardware_buffer` imports the buffer's
 ///   memory and reports its format.
@@ -23,6 +25,46 @@ pub const DEVICE_EXTENSIONS: [&CStr; 3] = [
     ash::ext::queue_family_foreign::NAME,
     ash::khr::external_semaphore_fd::NAME,
 ];
+
+/// What an `AHardwareBuffer` import needs of a Vulkan device beyond `wgpu`.
+///
+/// That is the [`DEVICE_EXTENSIONS`] and the `samplerYcbcrConversion`
+/// feature, with which external-format YCbCr buffers are converted; `wgpu`
+/// enables none of them on its own.
+///
+/// [`request_device`] applies them. A renderer that opens its device itself
+/// through `wgpu::hal::vulkan::Adapter::open_with_callback` keeps a value of
+/// this type alive across the call and passes the callback's arguments to
+/// [`Self::add_to`].
+#[derive(Debug, Default)]
+pub struct DeviceRequirements {
+    sampler_ycbcr_conversion: vk::PhysicalDeviceSamplerYcbcrConversionFeatures<'static>,
+}
+
+impl DeviceRequirements {
+    /// Adds the extensions and features to a device being opened, from inside
+    /// `open_with_callback`'s callback.
+    ///
+    /// The feature is chained into `arguments.create_info` as a
+    /// `VkPhysicalDeviceSamplerYcbcrConversionFeatures`, so the callback must
+    /// not also chain that structure or `VkPhysicalDeviceVulkan11Features`,
+    /// and must call this once per device. The adapter must support every
+    /// extension and the feature, which [`request_device`] checks.
+    pub fn add_to<'pnext>(
+        &'pnext mut self,
+        arguments: &mut wgpu::hal::vulkan::CreateDeviceCallbackArgs<'_, 'pnext, '_>,
+    ) {
+        for extension in DEVICE_EXTENSIONS {
+            if !arguments.extensions.contains(&extension) {
+                arguments.extensions.push(extension);
+            }
+        }
+        self.sampler_ycbcr_conversion.sampler_ycbcr_conversion = vk::TRUE;
+        *arguments.create_info = arguments
+            .create_info
+            .push_next(&mut self.sampler_ycbcr_conversion);
+    }
+}
 
 /// Why [`request_device`] could not open a device.
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +83,10 @@ pub enum DeviceRequestError {
     /// The adapter does not offer one of [`DEVICE_EXTENSIONS`].
     #[error("the Vulkan adapter does not support the device extension {0:?}")]
     MissingExtension(&'static CStr),
+    /// The adapter does not offer a Vulkan feature [`DeviceRequirements`]
+    /// names.
+    #[error("the Vulkan adapter does not support the device feature {0}")]
+    MissingFeature(&'static str),
     /// The descriptor asks for features the adapter does not have.
     #[error("the adapter does not support the requested features {0:?}")]
     UnsupportedFeatures(wgpu::Features),
@@ -68,7 +114,7 @@ pub enum DeviceRequestError {
 }
 
 /// Opens a device on `adapter` that can import `AHardwareBuffer`s, enabling
-/// [`DEVICE_EXTENSIONS`] alongside whatever `descriptor` asks for.
+/// the [`DeviceRequirements`] alongside whatever `descriptor` asks for.
 ///
 /// `wgpu` has no portable way to enable extra device extensions, so this opens
 /// the device through `wgpu-hal`'s creation callback and hands it to `wgpu`.
@@ -82,8 +128,8 @@ pub enum DeviceRequestError {
 /// # Errors
 ///
 /// Returns an error when the adapter cannot provide Vulkan 1.1, one of the
-/// extensions, or the requested features and limits, or when device creation
-/// fails.
+/// extensions, the `samplerYcbcrConversion` feature, or the requested
+/// features and limits, or when device creation fails.
 ///
 /// # Panics
 ///
@@ -116,24 +162,27 @@ pub fn request_device(
     {
         return Err(DeviceRequestError::MissingExtension(missing));
     }
+    if !supports_sampler_ycbcr_conversion(&hal_adapter) {
+        return Err(DeviceRequestError::MissingFeature("samplerYcbcrConversion"));
+    }
+    let mut requirements = DeviceRequirements::default();
     // SAFETY: `open_with_callback` has `Adapter::open`'s contract — features
     // and limits the adapter supports — plus the callback's: it may only add
     // what the device supports and must not remove anything.
     // `check_descriptor` verified the features and limits against this
-    // adapter, and the callback only appends extensions that were just checked
-    // with `supports_extension`, skipping any `wgpu` already enabled. Their
-    // dependencies are core in the Vulkan 1.1 the device was checked to have.
+    // adapter. The callback only appends extensions that were just checked
+    // with `supports_extension`, skipping any `wgpu` already enabled, and
+    // chains the YCbCr conversion feature just checked as supported, which
+    // `wgpu-hal` itself never chains. The extensions' dependencies are core in
+    // the Vulkan 1.1 the device was checked to have. `requirements` outlives
+    // the call, so the chained feature struct does too.
     let open_device = unsafe {
         hal_adapter.open_with_callback(
             descriptor.required_features,
             &descriptor.required_limits,
             &descriptor.memory_hints,
-            Some(Box::new(|arguments| {
-                for extension in DEVICE_EXTENSIONS {
-                    if !arguments.extensions.contains(&extension) {
-                        arguments.extensions.push(extension);
-                    }
-                }
+            Some(Box::new(|mut arguments| {
+                requirements.add_to(&mut arguments);
             })),
         )
     }
@@ -145,6 +194,23 @@ pub fn request_device(
     // `descriptor`'s features, limits, and memory hints.
     let device = unsafe { adapter.create_device_from_hal(open_device, descriptor) }?;
     Ok(device)
+}
+
+fn supports_sampler_ycbcr_conversion(hal_adapter: &wgpu::hal::vulkan::Adapter) -> bool {
+    let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut ycbcr);
+    // SAFETY: the instance and physical device come from the live hal adapter
+    // guard, so they are valid and belong together; the device was checked to
+    // support Vulkan 1.1, where the chained struct is core, and the instance
+    // `wgpu` creates is at least 1.1. Both structs are initialized locals the
+    // query writes through.
+    unsafe {
+        hal_adapter
+            .shared_instance()
+            .raw_instance()
+            .get_physical_device_features2(hal_adapter.raw_physical_device(), &mut features);
+    }
+    ycbcr.sampler_ycbcr_conversion == vk::TRUE
 }
 
 fn check_descriptor(

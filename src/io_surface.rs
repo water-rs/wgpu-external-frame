@@ -41,6 +41,8 @@ use objc2_metal::{
     MTLTextureUsage,
 };
 
+use crate::YcbcrRange;
+
 /// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`.
 const PIXEL_FORMAT_420V: u32 = u32::from_be_bytes(*b"420v");
 /// `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`.
@@ -84,16 +86,6 @@ pub enum YcbcrDepth {
     Eight,
     /// 10-bit samples in the high bits of a 16-bit element.
     Ten,
-}
-
-/// The code range a [`Ycbcr420Format`]'s samples span, which a consumer needs
-/// to convert them to RGB.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum YcbcrRange {
-    /// Video ("studio") range: luma spans 16–235 and chroma 16–240, at 8 bits.
-    Video,
-    /// Full range: luma and chroma span every code value.
-    Full,
 }
 
 /// One plane of a [`Ycbcr420IoSurfaceFrame`].

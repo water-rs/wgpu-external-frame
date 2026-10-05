@@ -21,7 +21,9 @@
 //!   backend the `wgpu` device runs on.
 //! - [`ahardware_buffer`] — Android `AHardwareBuffer`, imported through Vulkan
 //!   (`VK_ANDROID_external_memory_android_hardware_buffer`) and adopted by
-//!   `wgpu` without a copy.
+//!   `wgpu` without a copy, except for YCbCr buffers the driver describes only
+//!   through an external format, which a GPU pass converts into planes `wgpu`
+//!   owns.
 //! - [`io_surface`] — macOS and iOS `IOSurface`, packed RGBA/BGRA or
 //!   biplanar 4:2:0 YCbCr one plane per texture, imported through
 //!   `MTLDevice::newTextureWithDescriptor:iosurface:plane:`.
@@ -42,3 +44,6 @@ pub mod io_surface;
 pub mod shared_handle;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod vulkan_memory;
+mod ycbcr;
+
+pub use ycbcr::{YcbcrEncoding, YcbcrMatrix, YcbcrRange};
