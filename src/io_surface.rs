@@ -29,9 +29,39 @@
 //! Producers typically hand the surface over inside a callback and reclaim it
 //! the moment that callback returns, so each frame type's `retain` takes a
 //! reference on it first; the frame owns that reference until it is dropped.
+//!
+//! # Returning the surface to its producer
+//!
+//! An imported texture aliases the surface's memory rather than owning a copy
+//! of it. A producer that recycles its surfaces — a camera or a video decoder
+//! drawing `CVPixelBuffer`s from a pool — therefore needs to know when the GPU
+//! has finished reading one, and the frame's reference on the surface does not
+//! tell it. Such a producer attaches the object it recycles to the frame as
+//! the frame's *owner* ([`PackedIoSurfaceFrame::with_owner`],
+//! [`Ycbcr420IoSurfaceFrame::with_owner`]), and gets it back when the owner
+//! is dropped: once the frame and every texture imported from it have been
+//! destroyed.
+//!
+//! `wgpu` destroys a texture only once it has been dropped, together with
+//! every view and bind group of it, and every submission that used it has
+//! completed. The owner therefore outlives every GPU use of the surface,
+//! however the consumer drops its textures, and whether or not it ever submits
+//! work that reads them. Nothing waits on a later submission either: a texture
+//! no pending submission uses is destroyed when it is dropped.
+//!
+//! A frame shares its owner with the textures imported from it. A
+//! [`Ycbcr420IoSurfaceFrame`] imports each plane as its own texture, and each
+//! of those holds a share, so the owner is dropped only after the frame and
+//! both plane textures are gone, in whichever order they go.
+//!
+//! The owner is dropped on the thread that destroys the last of them: the one
+//! that drops the frame or a texture no pending submission uses, or the one
+//! inside `wgpu::Device::poll` or `wgpu::Queue::submit` that finds the last
+//! submission using it complete. Its `Drop` must not block on the GPU.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use objc2::runtime::ProtocolObject;
 use objc2_core_foundation::CFRetained;
@@ -40,6 +70,7 @@ use objc2_metal::{
     MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTextureDescriptor, MTLTextureType,
     MTLTextureUsage,
 };
+use sync_wrapper::SyncWrapper;
 
 use crate::YcbcrRange;
 
@@ -180,6 +211,7 @@ pub struct PackedIoSurfaceFrame {
     format: PackedFormat,
     width: u32,
     height: u32,
+    owner: Option<SharedOwner>,
 }
 
 impl core::fmt::Debug for PackedIoSurfaceFrame {
@@ -189,6 +221,7 @@ impl core::fmt::Debug for PackedIoSurfaceFrame {
             .field("format", &self.format)
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("owned", &self.owner.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -232,7 +265,23 @@ impl PackedIoSurfaceFrame {
             format,
             width,
             height,
+            owner: None,
         }
+    }
+
+    /// Attaches the producer's owner of the surface, such as the
+    /// `CVPixelBuffer` it lent, which is dropped once this frame and every
+    /// texture imported from it have been destroyed; see
+    /// [Returning the surface to its producer](crate::io_surface#returning-the-surface-to-its-producer).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frame already carries an owner, since only one producer
+    /// can own the surface.
+    #[must_use]
+    pub fn with_owner(mut self, owner: impl Send + 'static) -> Self {
+        SharedOwner::attach(&mut self.owner, owner);
+        self
     }
 
     /// The surface's allocated pixel width.
@@ -257,9 +306,9 @@ impl PackedIoSurfaceFrame {
     /// `device`.
     ///
     /// The texture aliases the surface's memory rather than owning a copy of
-    /// it, so the producer may overwrite it as soon as it takes the surface
-    /// back; copy out of, or finish sampling, the returned texture before that
-    /// happens.
+    /// it, and holds a share of the frame's [owner](Self::with_owner) until
+    /// `wgpu` destroys it. A producer that takes the surface back without
+    /// waiting for its owner may overwrite it while the GPU still reads it.
     ///
     /// # Panics
     ///
@@ -277,6 +326,7 @@ impl PackedIoSurfaceFrame {
                 width: self.width,
                 height: self.height,
             },
+            self.owner.as_ref(),
         )
     }
 }
@@ -287,6 +337,7 @@ pub struct Ycbcr420IoSurfaceFrame {
     format: Ycbcr420Format,
     /// Width and height of each plane, indexed by [`Ycbcr420Plane::index`].
     extents: [(u32, u32); 2],
+    owner: Option<SharedOwner>,
 }
 
 impl core::fmt::Debug for Ycbcr420IoSurfaceFrame {
@@ -296,6 +347,7 @@ impl core::fmt::Debug for Ycbcr420IoSurfaceFrame {
             .field("format", &self.format)
             .field("luma", &self.extents[0])
             .field("chroma", &self.extents[1])
+            .field("owned", &self.owner.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -342,7 +394,23 @@ impl Ycbcr420IoSurfaceFrame {
             surface,
             format,
             extents,
+            owner: None,
         }
+    }
+
+    /// Attaches the producer's owner of the surface, such as the
+    /// `CVPixelBuffer` it lent, which is dropped once this frame and the
+    /// textures of every plane imported from it have all been destroyed; see
+    /// [Returning the surface to its producer](crate::io_surface#returning-the-surface-to-its-producer).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frame already carries an owner, since only one producer
+    /// can own the surface.
+    #[must_use]
+    pub fn with_owner(mut self, owner: impl Send + 'static) -> Self {
+        SharedOwner::attach(&mut self.owner, owner);
+        self
     }
 
     /// The surface's pixel format.
@@ -368,9 +436,10 @@ impl Ycbcr420IoSurfaceFrame {
     /// [`Ycbcr420Format::texture_format`] for it.
     ///
     /// The texture aliases the surface's memory rather than owning a copy of
-    /// it, so the producer may overwrite it as soon as it takes the surface
-    /// back; copy out of, or finish sampling, the returned texture before that
-    /// happens.
+    /// it, and holds a share of the frame's [owner](Self::with_owner) until
+    /// `wgpu` destroys it, as the texture of every other plane imported from
+    /// this frame does. A producer that takes the surface back without waiting
+    /// for its owner may overwrite it while the GPU still reads it.
     ///
     /// # Panics
     ///
@@ -399,7 +468,39 @@ impl Ycbcr420IoSurfaceFrame {
                 width,
                 height,
             },
+            self.owner.as_ref(),
         )
+    }
+}
+
+/// The producer's owner of a surface, shared by a frame and every texture
+/// imported from it; whichever drops the last share drops the owner.
+///
+/// The owner only has to be `Send`, while a `wgpu` drop callback must also be
+/// `Sync`. Nothing ever reaches the owner through a shared reference — it is
+/// only ever dropped — so [`SyncWrapper`] makes the share `Sync` soundly.
+#[derive(Clone)]
+struct SharedOwner {
+    _owner: Arc<SyncWrapper<Box<dyn Send>>>,
+}
+
+impl SharedOwner {
+    /// Stores `owner` in a frame's empty owner `slot`.
+    fn attach(slot: &mut Option<Self>, owner: impl Send + 'static) {
+        assert!(
+            slot.is_none(),
+            "an IOSurface frame carries at most one owner"
+        );
+        *slot = Some(Self {
+            _owner: Arc::new(SyncWrapper::new(Box::new(owner))),
+        });
+    }
+
+    /// A `wgpu` drop callback that holds a share of the owner until `wgpu`
+    /// destroys the texture it is attached to.
+    fn drop_callback(&self) -> wgpu::hal::DropCallback {
+        let share = self.clone();
+        Box::new(move || drop(share))
     }
 }
 
@@ -443,7 +544,8 @@ struct PlaneImport {
     height: u32,
 }
 
-/// Imports plane `plane.index` of `surface` as a texture on `device`.
+/// Imports plane `plane.index` of `surface` as a texture on `device`, which
+/// holds a share of `owner` until `wgpu` destroys it.
 ///
 /// `plane` must describe that plane of `surface`: every frame type derives it
 /// from the surface itself when the frame is retained.
@@ -451,6 +553,7 @@ fn import_plane(
     device: &wgpu::Device,
     surface: &IOSurfaceRef,
     plane: &PlaneImport,
+    owner: Option<&SharedOwner>,
 ) -> wgpu::Texture {
     let descriptor = wgpu::TextureDescriptor {
         label: Some(plane.label),
@@ -498,6 +601,9 @@ fn import_plane(
         // SAFETY: the texture was created from `metal_descriptor` immediately above,
         // so the format, type, mip and layer counts repeated here match it, and
         // ownership of the `MTLTexture` transfers to the returned hal texture.
+        // The hal texture runs the drop callback after it releases the
+        // `MTLTexture`, so the owner's share outlives the texture's own
+        // reference on the surface.
         unsafe {
             <wgpu::hal::api::Metal as wgpu::hal::Api>::Device::texture_from_raw(
                 texture,
@@ -510,7 +616,7 @@ fn import_plane(
                     height: plane.height,
                     depth: 1,
                 },
-                None,
+                owner.map(SharedOwner::drop_callback),
             )
         }
     });

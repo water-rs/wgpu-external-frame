@@ -4,7 +4,8 @@
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use std::ptr::NonNull;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak, mpsc};
 
 use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_video::{
@@ -210,21 +211,19 @@ fn fill(surface: &IOSurfaceRef, region: Region, samples: Samples) {
     assert_eq!(status, 0, "IOSurfaceUnlock failed");
 }
 
-/// Reads every texel of `texture` through a shader binding of it.
-fn sample(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<[f32; 4]> {
+/// Records into `encoder` a pass that loads every texel of `texture` through
+/// a shader binding of it, and returns the storage buffer the texels land in.
+fn encode_sample(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    texture: &wgpu::Texture,
+) -> wgpu::Buffer {
     let size = texture.size();
     let texels = u64::from(size.width) * u64::from(size.height);
-    let bytes = texels * 16;
     let storage = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("io_surface_test_texels"),
-        size: bytes,
+        size: texels * 16,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("io_surface_test_readback"),
-        size: bytes,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let module = device.create_shader_module(wgpu::include_wgsl!("sample_plane.wgsl"));
@@ -251,15 +250,27 @@ fn sample(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -
             },
         ],
     });
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+    pass.set_pipeline(&pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.dispatch_workgroups(size.width.div_ceil(8), size.height.div_ceil(8), 1);
+    drop(pass);
+    storage
+}
+
+/// Reads every texel of `texture` through a shader binding of it.
+fn sample(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<[f32; 4]> {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("io_surface_test_sample"),
     });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(size.width.div_ceil(8), size.height.div_ceil(8), 1);
-    }
+    let storage = encode_sample(device, &mut encoder, texture);
+    let bytes = storage.size();
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("io_surface_test_readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     encoder.copy_buffer_to_buffer(&storage, 0, &readback, 0, bytes);
     queue.submit([encoder.finish()]);
     let (sender, receiver) = mpsc::channel();
@@ -427,5 +438,157 @@ fn ycbcr420_10bit_full_range_imports_both_planes() {
             depth: YcbcrDepth::Ten,
             range: YcbcrRange::Full,
         },
+    );
+}
+
+/// Records into `encoder` compute work that keeps the GPU busy for far longer
+/// than the CPU takes to check on a submission right after making it: about
+/// 0.4 s on an M2 Max.
+fn encode_spin(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+    const WORKGROUPS: u32 = 4096;
+    const DISPATCHES: usize = 4;
+    let module = device.create_shader_module(wgpu::include_wgsl!("spin.wgsl"));
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("io_surface_test_spin"),
+        layout: None,
+        module: &module,
+        entry_point: Some("spin"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let sink = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("io_surface_test_spin"),
+        size: u64::from(WORKGROUPS) * 64 * 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("io_surface_test_spin"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: sink.as_entire_binding(),
+        }],
+    });
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+    pass.set_pipeline(&pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    // Each dispatch writes the sink the previous one wrote, so they run one
+    // after another rather than overlapping.
+    for _ in 0..DISPATCHES {
+        pass.dispatch_workgroups(WORKGROUPS, 1, 1);
+    }
+}
+
+/// A frame owner the test can watch: the owner is the only strong reference,
+/// so the returned weak one stops upgrading the moment the owner is dropped.
+fn watched_owner() -> (Arc<()>, Weak<()>) {
+    let owner = Arc::new(());
+    let watch = Arc::downgrade(&owner);
+    (owner, watch)
+}
+
+fn poll(device: &wgpu::Device, poll: wgpu::PollType) {
+    device.poll(poll).expect("polling the device failed");
+}
+
+#[test]
+fn owner_outlives_a_pending_submission_that_samples_the_texture() {
+    let (device, queue) = gpu();
+    let surface = packed_surface(kCVPixelFormatType_32BGRA);
+    let (owner, watch) = watched_owner();
+    // SAFETY: `surface` is a live IOSurface this test retains.
+    let frame = unsafe {
+        PackedIoSurfaceFrame::retain(NonNull::from(&*surface).cast(), PackedFormat::Bgra8)
+    }
+    .with_owner(owner);
+    drop(surface);
+    let texture = frame.import(&device);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("io_surface_test_pending"),
+    });
+    encode_spin(&device, &mut encoder);
+    // The sampling pass is recorded after the spin, so it cannot complete
+    // before the spin does.
+    let storage = encode_sample(&device, &mut encoder, &texture);
+    queue.submit([encoder.finish()]);
+    let completed = Arc::new(AtomicBool::new(false));
+    let signal = Arc::clone(&completed);
+    queue.on_submitted_work_done(move || signal.store(true, Ordering::Release));
+    // Everything the consumer holds goes at once, the way a consumer drops a
+    // frame it has finished with right after submitting the work that reads
+    // it.
+    drop((frame, texture, storage));
+    poll(&device, wgpu::PollType::Poll);
+    assert!(
+        !completed.load(Ordering::Acquire),
+        "the submission completed before the check, so it no longer shows anything: lengthen \
+         the spin"
+    );
+    assert_eq!(
+        watch.strong_count(),
+        1,
+        "the owner was dropped while a submission sampling the texture was pending"
+    );
+    poll(&device, wgpu::PollType::wait_indefinitely());
+    assert!(completed.load(Ordering::Acquire));
+    assert_eq!(
+        watch.strong_count(),
+        0,
+        "the owner outlived the last submission that used the texture"
+    );
+}
+
+#[test]
+fn owner_of_a_texture_no_submission_uses_is_dropped_with_it() {
+    let (device, _queue) = gpu();
+    let surface = packed_surface(kCVPixelFormatType_32BGRA);
+    let (owner, watch) = watched_owner();
+    // SAFETY: `surface` is a live IOSurface this test retains.
+    let frame = unsafe {
+        PackedIoSurfaceFrame::retain(NonNull::from(&*surface).cast(), PackedFormat::Bgra8)
+    }
+    .with_owner(owner);
+    drop(surface);
+    let texture = frame.import(&device);
+    drop(frame);
+    assert_eq!(
+        watch.strong_count(),
+        1,
+        "the owner was dropped with the frame while its texture was alive"
+    );
+    // No submission uses the texture, so `wgpu` destroys it on the spot,
+    // without waiting for a poll.
+    drop(texture);
+    assert_eq!(
+        watch.strong_count(),
+        0,
+        "the owner of a texture no submission used outlived it"
+    );
+}
+
+#[test]
+fn ycbcr420_owner_waits_for_every_plane_texture() {
+    let (device, _queue) = gpu();
+    let surface = pixel_buffer_surface(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+    let (owner, watch) = watched_owner();
+    // SAFETY: `surface` is a live IOSurface this test retains.
+    let frame = unsafe { Ycbcr420IoSurfaceFrame::retain(NonNull::from(&*surface).cast()) }
+        .with_owner(owner);
+    drop(surface);
+    let luma = frame.import(&device, Ycbcr420Plane::Luma);
+    let chroma = frame.import(&device, Ycbcr420Plane::Chroma);
+    drop((frame, luma));
+    poll(&device, wgpu::PollType::wait_indefinitely());
+    assert_eq!(
+        watch.strong_count(),
+        1,
+        "the owner was dropped while the chroma plane's texture was alive"
+    );
+    drop(chroma);
+    assert_eq!(
+        watch.strong_count(),
+        0,
+        "the owner outlived both plane textures"
     );
 }
