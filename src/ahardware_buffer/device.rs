@@ -182,7 +182,7 @@ pub fn request_device(
             &descriptor.required_limits,
             &descriptor.memory_hints,
             Some(Box::new(|mut arguments| {
-                requirements.add_to(&mut arguments)
+                requirements.add_to(&mut arguments);
             })),
         )
     }

@@ -2,10 +2,13 @@
 //!
 //! Android producers — `AImageReader` with GPU usage, `MediaCodec`,
 //! `SurfaceControl` — hand out frames as `AHardwareBuffer`s. Vulkan imports
-//! one through `VK_ANDROID_external_memory_android_hardware_buffer`, and `wgpu`
-//! adopts the resulting image through its `hal` layer, so the returned
-//! [`wgpu::Texture`] *is* the producer's buffer: no pixel is copied, by the CPU
-//! or the GPU.
+//! one through `VK_ANDROID_external_memory_android_hardware_buffer`. When the
+//! driver maps the buffer to a Vulkan format, `wgpu` adopts the resulting image
+//! through its `hal` layer, so the returned texture *is* the producer's buffer:
+//! no pixel is copied, by the CPU or the GPU. When the driver describes it only
+//! through an external format, a GPU pass copies its planes into textures
+//! `wgpu` owns ([External formats](#external-formats)); no pixel passes
+//! through the CPU either way.
 //!
 //! # Device
 //!
