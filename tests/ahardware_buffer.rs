@@ -15,10 +15,9 @@ use ash::vk;
 use ndk::hardware_buffer::HardwareBufferRef;
 
 use wgpu_external_frame::ahardware_buffer::{
-    CONVERSION_DEVICE_EXTENSIONS, DEVICE_EXTENSIONS, HardwareBuffer, HardwareBufferDesc,
-    HardwareBufferFormat, HardwareBufferFrame, HardwareBufferImportError, HardwareBufferImporter,
-    HardwareBufferLease, HardwareBufferUsage, ImportedHardwareBuffer, Ycbcr420Planes,
-    request_device,
+    DeviceRequirements, HardwareBuffer, HardwareBufferDesc, HardwareBufferFormat,
+    HardwareBufferFrame, HardwareBufferImportError, HardwareBufferImporter, HardwareBufferLease,
+    HardwareBufferUsage, ImportedHardwareBuffer, Ycbcr420Planes, request_device,
 };
 
 const WIDTH: u32 = 64;
@@ -66,47 +65,45 @@ impl Gpu {
         Self::on(device, queue)
     }
 
-    /// A device opened with every requirement of the import except the
-    /// [`CONVERSION_DEVICE_EXTENSIONS`], as on an adapter that does not offer
-    /// them.
-    fn without_conversion_extensions() -> Self {
+    /// A device opened through `wgpu-hal`'s creation callback with only the
+    /// [`DeviceRequirements`], as a renderer that opens its device itself
+    /// does, and checked to lack `VK_KHR_push_descriptor` and
+    /// `VK_KHR_maintenance6`, neither of which the conversion needs.
+    fn with_requirements_only() -> Self {
         let adapter = vulkan_adapter();
         let descriptor = device_descriptor();
         // SAFETY: the adapter is a Vulkan adapter, and the guard is only used
         // to open a device.
         let hal_adapter = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
             .expect("the adapter is a Vulkan adapter");
-        let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
-            .sampler_ycbcr_conversion(true);
+        let mut requirements =
+            DeviceRequirements::new(&hal_adapter).expect("the adapter imports hardware buffers");
         // SAFETY: the features and limits are the defaults plus
         // `TEXTURE_FORMAT_NV12`, which `vulkan_adapter` checked the adapter
-        // offers. The callback adds the import's required extensions and the
-        // YCbCr conversion feature, which `request_device` opens this adapter
-        // with in `Gpu::new`, so the adapter supports them; `ycbcr` outlives
-        // the call.
+        // offers. The callback only adds what `DeviceRequirements::new`
+        // checked the adapter supports, and `requirements` outlives the call.
         let open_device = unsafe {
             hal_adapter.open_with_callback(
                 descriptor.required_features,
                 &descriptor.required_limits,
                 &descriptor.memory_hints,
-                Some(Box::new(|arguments| {
-                    for extension in DEVICE_EXTENSIONS {
-                        if !arguments.extensions.contains(&extension) {
-                            arguments.extensions.push(extension);
-                        }
-                    }
-                    *arguments.create_info = arguments.create_info.push_next(&mut ycbcr);
+                Some(Box::new(|mut arguments| {
+                    requirements.add_to(&mut arguments);
                 })),
             )
         }
-        .expect("failed to open a device without the conversion extensions");
-        for extension in CONVERSION_DEVICE_EXTENSIONS {
+        .expect("failed to open a device with the import's requirements");
+        for extension in [
+            ash::khr::push_descriptor::NAME,
+            ash::khr::maintenance6::NAME,
+        ] {
             assert!(
                 !open_device
                     .device
                     .enabled_device_extensions()
                     .contains(&extension),
-                "wgpu enabled the conversion extension {extension:?} on its own"
+                "the device was opened with {extension:?}, so it does not show the conversion \
+                 works without it"
             );
         }
         drop(hal_adapter);
@@ -467,47 +464,47 @@ fn rgba_buffer_imports_with_its_texels() {
     assert_rgba_imports(&mut Gpu::new());
 }
 
-/// A device opened without the conversion extensions imports every buffer
-/// that needs no conversion, and rejects one that does with an error naming
-/// the missing extension.
+/// A device opened with nothing but the import's requirements — no
+/// `VK_KHR_push_descriptor` — imports RGBA buffers, and converts
+/// `Y8Cb8Cr8_420` buffers of an external format with several conversions in
+/// flight at once, each binding its own buffer.
 #[test]
-fn device_without_conversion_extensions_rejects_only_external_formats() {
-    let mut gpu = Gpu::without_conversion_extensions();
+fn device_without_push_descriptors_converts_frames_in_flight() {
+    let mut gpu = Gpu::with_requirements_only();
     assert_rgba_imports(&mut gpu);
 
-    let buffer = allocate(HardwareBufferFormat::Y8Cb8Cr8_420);
-    write_ycbcr(&buffer);
-    let (events, received) = mpsc::channel();
-    match gpu
-        .importer
-        .import(frame(&buffer, None, RecordingLease(events)))
-    {
-        // A driver that maps the buffer to `NV12` aliases it, no conversion
-        // needed.
-        Ok(ImportedHardwareBuffer::Ycbcr420(planes)) => {
-            assert_eq!(planes.luma.texture().format(), wgpu::TextureFormat::NV12);
-            assert_eq!(received.try_recv(), Ok(LeaseEvent::Presented));
-            read_planes(&gpu, &planes);
-            drop(planes);
-            gpu.wait();
-            assert_eq!(received.try_recv(), Ok(LeaseEvent::Released));
-        }
-        Ok(ImportedHardwareBuffer::Rgba(_)) => {
-            panic!("a Y8Cb8Cr8_420 buffer imports as YCbCr planes")
-        }
-        Err(HardwareBufferImportError::ConversionUnavailable {
-            external_format,
-            missing_extension,
-        }) => {
-            assert_ne!(external_format, 0, "Vulkan external formats are never zero");
-            assert_eq!(missing_extension, ash::khr::push_descriptor::NAME);
-            assert_eq!(
-                received.try_recv(),
-                Err(mpsc::TryRecvError::Disconnected),
-                "a rejected frame's lease is dropped, never presented"
-            );
-        }
-        Err(other) => panic!("unexpected rejection of a Y8Cb8Cr8_420 buffer: {other}"),
+    let buffers = [
+        allocate(HardwareBufferFormat::Y8Cb8Cr8_420),
+        allocate(HardwareBufferFormat::Y8Cb8Cr8_420),
+    ];
+    // Spinning first keeps the GPU busy, so the first conversion is still
+    // pending when the second is submitted.
+    gpu.spin();
+    let (imports, receivers): (Vec<_>, Vec<_>) = buffers
+        .iter()
+        .map(|buffer| {
+            write_ycbcr(buffer);
+            let (events, received) = mpsc::channel();
+            let ImportedHardwareBuffer::Ycbcr420(planes) = gpu
+                .importer
+                .import(frame(buffer, None, RecordingLease(events)))
+                .expect("a Y8Cb8Cr8_420 buffer imports without push descriptors")
+            else {
+                panic!("a Y8Cb8Cr8_420 buffer imports as YCbCr planes");
+            };
+            (planes, received)
+        })
+        .unzip();
+    for planes in &imports {
+        read_planes(&gpu, planes);
+    }
+    drop(imports);
+    gpu.wait();
+    for received in receivers {
+        assert_eq!(
+            received.try_iter().collect::<Vec<_>>(),
+            [LeaseEvent::Presented, LeaseEvent::Released]
+        );
     }
 }
 
