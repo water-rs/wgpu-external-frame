@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/water-rs/wgpu-external-frame/compare/v0.3.0...v0.4.0) - 2026-10-07
+
+### Added
+
+- *(ahardware_buffer)* [**breaking**] convert defined-format YCbCr buffers when the device lacks NV12
+
+### Other
+
+- bound and retry every apt connection
+
 ## [0.3.0](https://github.com/water-rs/wgpu-external-frame/compare/v0.2.0...v0.3.0) - 2026-10-06
 
 ### Fixed
