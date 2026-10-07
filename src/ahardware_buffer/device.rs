@@ -19,8 +19,8 @@ use ash::vk;
 ///   semaphore the GPU waits on.
 ///
 /// Their remaining dependencies are core in Vulkan 1.1, which
-/// [`DeviceRequirements::new`] requires. The external-format conversion needs
-/// no further extension.
+/// [`DeviceRequirements::new`] requires. The YCbCr conversion needs no
+/// further extension.
 pub const DEVICE_EXTENSIONS: [&CStr; 3] = [
     ash::android::external_memory_android_hardware_buffer::NAME,
     ash::ext::queue_family_foreign::NAME,
@@ -31,8 +31,11 @@ pub const DEVICE_EXTENSIONS: [&CStr; 3] = [
 /// checked against one adapter.
 ///
 /// That is the [`DEVICE_EXTENSIONS`] and the `samplerYcbcrConversion`
-/// feature, with which external-format YCbCr buffers are converted; `wgpu`
-/// enables none of them on its own.
+/// feature, with which YCbCr buffers are converted; `wgpu` enables none of
+/// them on its own. `wgpu::Features::TEXTURE_FORMAT_NV12` is not among them:
+/// when the device has it, a defined-format `Y8Cb8Cr8_420` buffer aliases as
+/// one `NV12` texture, and when it does not, the same buffer imports through
+/// the conversion.
 ///
 /// [`request_device`] applies them. A renderer that opens its device itself
 /// through `wgpu::hal::vulkan::Adapter::open_with_callback` creates a value
@@ -154,8 +157,10 @@ pub enum DeviceRequestError {
 /// the features and limits of `descriptor` are checked against the adapter
 /// here, with the same rules.
 ///
-/// Request `wgpu::Features::TEXTURE_FORMAT_NV12` in `descriptor` to import
-/// multi-planar YCbCr buffers.
+/// Request `wgpu::Features::TEXTURE_FORMAT_NV12` in `descriptor` to alias
+/// defined-format 4:2:0 YCbCr buffers as one `NV12` texture instead of
+/// converting them; the import works without it, so a device that lacks it
+/// is still served.
 ///
 /// # Errors
 ///
