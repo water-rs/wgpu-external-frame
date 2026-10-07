@@ -13,13 +13,16 @@ use super::{HardwareBufferUsage, Retirement};
 /// `format`, as a texture that aliases it, and submits its acquire from the
 /// producer.
 ///
+/// `format` must need no feature the device lacks; the importer chooses it
+/// from the device's features — `NV12` only when the device has
+/// `wgpu::Features::TEXTURE_FORMAT_NV12` — so no check is needed here.
+///
 /// `hal_device` is dropped before the texture is handed to `wgpu`.
 ///
 /// # Panics
 ///
-/// Panics when the device lacks the feature `format` needs, when the buffer's
-/// extent or mip chain is one `wgpu` cannot address for `format`, or when
-/// Vulkan fails to import it.
+/// Panics when the buffer's extent or mip chain is one `wgpu` cannot address
+/// for `format`, or when Vulkan fails to import it.
 pub(super) fn import(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -35,13 +38,6 @@ pub(super) fn import(
         mut lease,
     } = parts;
     let layout = TextureLayout::new(&description, format);
-    let required = format.required_features();
-    assert!(
-        device.features().contains(required),
-        "importing an AHardwareBuffer of format {:?} as {format:?} requires the device feature \
-         {required:?}",
-        description.format,
-    );
     let imported = vulkan::import_buffer(
         &hal_device,
         buffer.buffer(),

@@ -5,18 +5,19 @@
 //! one through `VK_ANDROID_external_memory_android_hardware_buffer`. When the
 //! driver maps the buffer to a Vulkan format, `wgpu` adopts the resulting image
 //! through its `hal` layer, so the returned texture *is* the producer's buffer:
-//! no pixel is copied, by the CPU or the GPU. When the driver describes it only
-//! through an external format, a GPU pass copies its planes into textures
-//! `wgpu` owns ([External formats](#external-formats)); no pixel passes
-//! through the CPU either way.
+//! no pixel is copied, by the CPU or the GPU — unless a YCbCr buffer cannot be
+//! aliased, either because the driver describes it only through an external
+//! format or because the device lacks `TEXTURE_FORMAT_NV12`, in which case a
+//! GPU pass copies its planes into textures `wgpu` owns
+//! ([Conversion](#conversion)); no pixel passes through the CPU either way.
 //!
 //! # Device
 //!
 //! The import needs device extensions `wgpu` does not enable by itself
 //! ([`DEVICE_EXTENSIONS`]) and the `samplerYcbcrConversion` feature, with
-//! which external formats are converted. Open the device with
-//! [`request_device`], or add them with [`DeviceRequirements`] in
-//! `wgpu-hal`'s device-creation callback when a renderer opens its device
+//! which YCbCr buffers the device cannot alias are converted. Open the
+//! device with [`request_device`], or add them with [`DeviceRequirements`]
+//! in `wgpu-hal`'s device-creation callback when a renderer opens its device
 //! itself.
 //!
 //! # Formats
@@ -28,26 +29,30 @@
 //! | Vulkan format the driver reports | [`ImportedHardwareBuffer`] | Textures |
 //! | --- | --- | --- |
 //! | `R8G8B8A8_UNORM` (`R8G8B8A8_UNORM`, `R8G8B8X8_UNORM` buffers) | [`Rgba`](ImportedHardwareBuffer::Rgba) | one `Rgba8Unorm` texture that aliases the buffer |
-//! | `G8_B8R8_2PLANE_420_UNORM` (`Y8Cb8Cr8_420` buffers, when the driver maps them) | [`Ycbcr420`](ImportedHardwareBuffer::Ycbcr420) | the `Plane0` and `Plane1` views of one `NV12` texture that aliases the buffer |
+//! | `G8_B8R8_2PLANE_420_UNORM` (`Y8Cb8Cr8_420` buffers, when the driver maps them) | [`Ycbcr420`](ImportedHardwareBuffer::Ycbcr420) | the `Plane0` and `Plane1` views of one `NV12` texture that aliases the buffer, or an `R8Unorm` and an `Rg8Unorm` texture converted from it when the device lacks `TEXTURE_FORMAT_NV12` |
 //! | `UNDEFINED`, with an implementation-defined *external format*, for a `Y8Cb8Cr8_420` buffer (camera frames and many allocated YCbCr buffers) | [`Ycbcr420`](ImportedHardwareBuffer::Ycbcr420) | an `R8Unorm` and an `Rg8Unorm` texture, converted from the buffer on the GPU |
 //!
 //! Both kinds of [`Ycbcr420Planes`] read the same way: a full-resolution luma
 //! plane sampled as `R8Unorm`, a half-resolution plane of interleaved Cb/Cr
 //! pairs sampled as `Rg8Unorm`, holding the stored codes, together with the
 //! [`YcbcrEncoding`] the driver reports for the buffer.
-//! The aliased `NV12` texture needs `wgpu::Features::TEXTURE_FORMAT_NV12` on
-//! the device.
+//! The `NV12` alias needs `wgpu::Features::TEXTURE_FORMAT_NV12`, which is an
+//! optimization, not a requirement: a device without it imports the same
+//! buffer through the conversion below. The importer chooses once, when it is
+//! created, from the device's features.
 //!
-//! # External formats
+//! # Conversion
 //!
-//! Many drivers describe 4:2:0 YCbCr buffers only through an external format,
-//! which can be read only through a sampler carrying a
-//! `VkSamplerYcbcrConversion`; on some drivers, such as the Mali-G715's, that
-//! is every such buffer, camera frames included. `wgpu` cannot express that
-//! sampler, so the import samples the buffer in a small raw Vulkan pass,
-//! submitted on the importer's queue, that writes the stored codes into two
-//! textures `wgpu` owns. No pixel passes through the CPU. The pass needs only
-//! the `samplerYcbcrConversion` feature, which every import requires. It binds
+//! Many drivers describe 4:2:0 YCbCr buffers only through an external
+//! format, which can be read only through a sampler carrying a
+//! `VkSamplerYcbcrConversion`; on some drivers, such as the Mali-G715's,
+//! that is every such buffer, camera frames included. `wgpu` cannot express
+//! that sampler, so the import samples the buffer in a small raw Vulkan
+//! pass, submitted on the importer's queue, that writes the stored codes
+//! into two textures `wgpu` owns. The same pass serves a defined-format
+//! `Y8Cb8Cr8_420` buffer on a device that cannot alias it as `NV12`. No
+//! pixel passes through the CPU. The pass needs only the
+//! `samplerYcbcrConversion` feature, which every import requires. It binds
 //! the buffer through a descriptor set from a pool sized for one combined
 //! image sampler with a YCbCr conversion:
 //! `maxCombinedImageSamplerDescriptorCount` descriptors where the device
@@ -89,6 +94,7 @@ mod device;
 mod frame;
 mod vulkan;
 
+pub use conversion::ConversionFormat;
 pub use device::{DEVICE_EXTENSIONS, DeviceRequestError, DeviceRequirements, request_device};
 pub use frame::{HardwareBufferFrame, HardwareBufferLease};
 pub use ndk::hardware_buffer::{HardwareBuffer, HardwareBufferDesc, HardwareBufferUsage};
@@ -124,27 +130,26 @@ pub enum HardwareBufferImportError {
         /// The driver's implementation-defined format identifier.
         external_format: u64,
     },
-    /// The buffer needs the external-format conversion, and the driver
-    /// refused to allocate the descriptor set that binds it to its YCbCr
-    /// sampler from a pool of `descriptor_count` combined image sampler
-    /// descriptors.
+    /// The buffer needs the YCbCr conversion, and the driver refused to
+    /// allocate the descriptor set that binds it to its YCbCr sampler from a
+    /// pool of `descriptor_count` combined image sampler descriptors.
     ///
     /// The count is the device's `maxCombinedImageSamplerDescriptorCount`
     /// when it reports one (`VK_KHR_maintenance6`), which the specification
     /// sizes for every format the device converts, and otherwise 3, the most
     /// planes a 4:2:0 format has, which the specification does not guarantee
     /// to suffice. On a device without the extension, this error means the
-    /// driver consumes more than 3 descriptors for this external format; on
-    /// one with it, that the driver contradicts its own property. It is not
-    /// retried.
+    /// driver consumes more than 3 descriptors for this format; on one with
+    /// it, that the driver contradicts its own property. It is not retried.
     #[error(
-        "the AHardwareBuffer has only the external format {external_format:#x}, and the Vulkan \
-         driver could not allocate the descriptor set that binds it to its YCbCr sampler from a \
-         pool of {descriptor_count} combined image sampler descriptors"
+        "the Vulkan driver could not allocate the descriptor set that binds the AHardwareBuffer's \
+         {format} to its YCbCr sampler from a pool of {descriptor_count} combined image sampler \
+         descriptors"
     )]
     ConversionDescriptorPool {
-        /// The driver's implementation-defined format identifier.
-        external_format: u64,
+        /// What the conversion samples the buffer through: its Vulkan
+        /// format, or its external format when the driver reports none.
+        format: ConversionFormat,
         /// The pool's combined image sampler descriptors.
         descriptor_count: u32,
     },
@@ -226,10 +231,15 @@ pub struct Ycbcr420Planes {
 /// Imports Android hardware buffers into textures on one `wgpu` device.
 #[derive(Debug)]
 pub struct HardwareBufferImporter {
-    /// The external-format conversion, created by the first import that
-    /// needs it. Declared first so it is dropped while the device is still
-    /// held.
+    /// The YCbCr conversion, created by the first import that needs it.
+    /// Declared first so it is dropped while the device is still held.
     converter: Option<Converter>,
+    /// Whether the device has `wgpu::Features::TEXTURE_FORMAT_NV12`, which
+    /// lets a defined-format `Y8Cb8Cr8_420` buffer alias as one `NV12`
+    /// texture. A device's features are fixed at its creation, so which of
+    /// aliasing and converting runs is decided once, here — never from a
+    /// failed attempt.
+    nv12: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
 }
@@ -259,6 +269,9 @@ impl HardwareBufferImporter {
         drop(hal_device);
         Self {
             converter: None,
+            nv12: device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_NV12),
             device: device.clone(),
             queue: queue.clone(),
         }
@@ -277,17 +290,15 @@ impl HardwareBufferImporter {
     /// Returns an error when the buffer is not GPU-sampled, protected,
     /// layered, of a format that has no `wgpu` equivalent, of an external
     /// format other than 8-bit 4:2:0 YCbCr, or of a YCbCr model that names no
-    /// matrix, or when the buffer needs the external-format conversion and
-    /// the driver cannot allocate its descriptor set
+    /// matrix, or when the buffer needs the YCbCr conversion and the driver
+    /// cannot allocate its descriptor set
     /// ([`HardwareBufferImportError::ConversionDescriptorPool`]). The frame,
     /// and with it the lease, is dropped.
     ///
     /// # Panics
     ///
-    /// Panics when the buffer is aliased as `NV12` and the device lacks
-    /// `wgpu::Features::TEXTURE_FORMAT_NV12`, when a YCbCr buffer is odd-sized
-    /// or mipmapped, which 4:2:0 planes cannot represent, or when Vulkan fails
-    /// to import it.
+    /// Panics when a YCbCr buffer is odd-sized or mipmapped, which 4:2:0
+    /// planes cannot represent, or when Vulkan fails to import it.
     pub fn import(
         &mut self,
         frame: HardwareBufferFrame,
@@ -340,26 +351,42 @@ impl HardwareBufferImporter {
             }
             vk::Format::G8_B8R8_2PLANE_420_UNORM => {
                 let encoding = ycbcr_encoding(&parts.description, &properties)?;
-                let texture = alias::import(
-                    &self.device,
-                    &self.queue,
-                    hal_device,
-                    parts,
-                    &properties,
-                    wgpu::TextureFormat::NV12,
-                );
-                let plane = |format, aspect| {
-                    texture.create_view(&wgpu::TextureViewDescriptor {
-                        format: Some(format),
-                        aspect,
-                        ..wgpu::TextureViewDescriptor::default()
-                    })
-                };
-                Ok(ImportedHardwareBuffer::Ycbcr420(Ycbcr420Planes {
-                    luma: plane(wgpu::TextureFormat::R8Unorm, wgpu::TextureAspect::Plane0),
-                    chroma: plane(wgpu::TextureFormat::Rg8Unorm, wgpu::TextureAspect::Plane1),
-                    encoding,
-                }))
+                if self.nv12 {
+                    let texture = alias::import(
+                        &self.device,
+                        &self.queue,
+                        hal_device,
+                        parts,
+                        &properties,
+                        wgpu::TextureFormat::NV12,
+                    );
+                    let plane = |format, aspect| {
+                        texture.create_view(&wgpu::TextureViewDescriptor {
+                            format: Some(format),
+                            aspect,
+                            ..wgpu::TextureViewDescriptor::default()
+                        })
+                    };
+                    Ok(ImportedHardwareBuffer::Ycbcr420(Ycbcr420Planes {
+                        luma: plane(wgpu::TextureFormat::R8Unorm, wgpu::TextureAspect::Plane0),
+                        chroma: plane(wgpu::TextureFormat::Rg8Unorm, wgpu::TextureAspect::Plane1),
+                        encoding,
+                    }))
+                } else {
+                    let converter = self
+                        .converter
+                        .get_or_insert_with(|| Converter::new(&hal_device));
+                    let planes = conversion::import(
+                        &self.device,
+                        &self.queue,
+                        converter,
+                        hal_device,
+                        parts,
+                        &properties,
+                        encoding,
+                    )?;
+                    Ok(ImportedHardwareBuffer::Ycbcr420(planes))
+                }
             }
             other => Err(HardwareBufferImportError::UnsupportedFormat {
                 format: parts.description.format,

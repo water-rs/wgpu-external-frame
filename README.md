@@ -30,14 +30,15 @@ buffer itself, so nothing is copied. A 4:2:0 YCbCr buffer imports as two plane
 views — luma `R8Unorm`, interleaved Cb/Cr `Rg8Unorm` — with the matrix and
 range the Vulkan driver reports for it:
 
-- when the driver maps the buffer to `G8_B8R8_2PLANE_420_UNORM`, the views are
-  planes of one `NV12` texture that aliases the buffer;
-- when the driver describes it only with an implementation-defined external
-  format, as some drivers do for every YCbCr buffer, camera frames included,
-  sampling it needs a `VkSamplerYcbcrConversion`, which `wgpu` cannot express.
-  The import then converts it on the GPU, in a small raw Vulkan pass on the
-  importer's queue, into two textures `wgpu` owns. No pixel passes through the
-  CPU.
+- when the driver maps the buffer to `G8_B8R8_2PLANE_420_UNORM` and the
+  device has `TEXTURE_FORMAT_NV12`, the views are planes of one `NV12`
+  texture that aliases the buffer;
+- when the device lacks that feature, or the driver describes the buffer only
+  with an implementation-defined external format — as some drivers do for
+  every YCbCr buffer, camera frames included — sampling it needs a
+  `VkSamplerYcbcrConversion`, which `wgpu` cannot express. The import then
+  converts it on the GPU, in a small raw Vulkan pass on the importer's queue,
+  into two textures `wgpu` owns. No pixel passes through the CPU.
 
 The device must be opened with the extensions and the YCbCr conversion feature
 the import needs, which `wgpu` does not enable on its own;
