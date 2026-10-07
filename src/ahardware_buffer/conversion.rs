@@ -1,12 +1,15 @@
-//! The GPU pass that converts an external-format 4:2:0 YCbCr buffer into a
-//! luma and a chroma texture `wgpu` owns.
+//! The GPU pass that converts a 4:2:0 YCbCr buffer into a luma and a chroma
+//! texture `wgpu` owns.
 //!
-//! An external-format image can only be read through a sampler carrying a
-//! `VkSamplerYcbcrConversion`, bound as the immutable sampler of a combined
-//! image sampler. `wgpu` cannot express either, so this pass is raw Vulkan:
-//! two render passes that sample the buffer with the `RGB_IDENTITY` model —
-//! the stored codes, unconverted — and write luma into an `R8Unorm` texture
-//! and the Cb/Cr pairs into an `Rg8Unorm` texture at half the extent.
+//! A buffer reaches this pass when the driver describes it only through an
+//! external format, which can be read only through a sampler carrying a
+//! `VkSamplerYcbcrConversion`, or when the driver maps it to
+//! `G8_B8R8_2PLANE_420_UNORM` and the device lacks
+//! `wgpu::Features::TEXTURE_FORMAT_NV12` to alias it as `NV12`. `wgpu`
+//! cannot express the sampler, so this pass is raw Vulkan: two render
+//! passes that sample the buffer with the `RGB_IDENTITY` model — the stored
+//! codes, unconverted — and write luma into an `R8Unorm` texture and the
+//! Cb/Cr pairs into an `Rg8Unorm` texture at half the extent.
 //!
 //! The objects that depend only on the device ([`Shared`]) and those that
 //! depend on the buffer's conversion parameters ([`ConversionPipeline`]) are
@@ -38,8 +41,59 @@ pub(super) const CHROMA_FORMAT: (wgpu::TextureFormat, vk::Format) =
 const VERTEX_SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ycbcr_planes.vert.spv"));
 const FRAGMENT_SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ycbcr_planes.frag.spv"));
 
-/// Imports the external-format buffer of `parts` by converting it into a
-/// luma and a chroma texture, and submits the conversion.
+/// What a `VkSamplerYcbcrConversion` is built for, as the driver describes
+/// the buffer.
+///
+/// A buffer with a Vulkan format is converted with a conversion built for
+/// that format, which is how a defined-format `Y8Cb8Cr8_420` buffer imports
+/// on a device without `wgpu::Features::TEXTURE_FORMAT_NV12`; a buffer the
+/// driver maps to no Vulkan format is converted with one built for its
+/// implementation-defined external format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConversionFormat {
+    /// A Vulkan format, as a raw `VkFormat` value.
+    Defined(i32),
+    /// An implementation-defined external format.
+    External(u64),
+}
+
+impl ConversionFormat {
+    /// The format the driver's description of the buffer implies.
+    const fn of(properties: &BufferProperties) -> Self {
+        match properties.format {
+            vk::Format::UNDEFINED => Self::External(properties.external_format),
+            format => Self::Defined(format.as_raw()),
+        }
+    }
+
+    /// The `VkFormat` the conversion and the source's view are created
+    /// with: the buffer's own, or `UNDEFINED` for an external format.
+    const fn vk_format(self) -> vk::Format {
+        match self {
+            Self::Defined(format) => vk::Format::from_raw(format),
+            Self::External(_) => vk::Format::UNDEFINED,
+        }
+    }
+}
+
+impl core::fmt::Display for ConversionFormat {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Defined(format) => {
+                write!(
+                    formatter,
+                    "Vulkan format {:?}",
+                    vk::Format::from_raw(*format)
+                )
+            }
+            Self::External(format) => write!(formatter, "external format {format:#x}"),
+        }
+    }
+}
+
+/// Imports the buffer of `parts` — of an external format, or of a defined
+/// YCbCr format the device cannot alias — by converting it into a luma and
+/// a chroma texture, and submits the conversion.
 ///
 /// The conversion is submitted before this returns, so every later submission
 /// that uses the planes runs after it. Once it has completed, the buffer and
@@ -100,7 +154,16 @@ pub(super) fn import(
         buffer.buffer(),
         properties,
         &ImageShape {
-            format: ImageFormat::External(properties.external_format),
+            format: match pipeline.key.format {
+                ConversionFormat::Defined(format) => ImageFormat::Defined {
+                    format: vk::Format::from_raw(format),
+                    // The conversion views the image whole, in its own
+                    // format, so it needs neither MUTABLE_FORMAT nor
+                    // EXTENDED_USAGE.
+                    multi_planar: false,
+                },
+                ConversionFormat::External(external) => ImageFormat::External(external),
+            },
             width: extent.width,
             height: extent.height,
             mip_levels: 1,
@@ -263,18 +326,18 @@ impl PlaneTexture {
 /// The parameters a `VkSamplerYcbcrConversion` is created from, and so the
 /// key its cached pipeline is found by.
 ///
-/// The model is always `RGB_IDENTITY`, which ignores the range, and an
-/// external-format conversion ignores its component swizzle, so neither is
-/// part of the key.
+/// The model is always `RGB_IDENTITY`, which ignores the range, and every
+/// conversion is built with the identity component mapping — which an
+/// external format ignores anyway — so neither is part of the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ConversionKey {
-    external_format: u64,
+    format: ConversionFormat,
     x_chroma_offset: vk::ChromaLocation,
     y_chroma_offset: vk::ChromaLocation,
 }
 
-/// Converts external-format buffers on one device, caching a pipeline per
-/// set of conversion parameters.
+/// Converts YCbCr buffers on one device, caching a pipeline per set of
+/// conversion parameters.
 pub(super) struct Converter {
     shared: Arc<Shared>,
     pipelines: HashMap<ConversionKey, Arc<ConversionPipeline>>,
@@ -310,7 +373,7 @@ impl Converter {
     /// use.
     pub(super) fn pipeline(&mut self, properties: &BufferProperties) -> Arc<ConversionPipeline> {
         let key = ConversionKey {
-            external_format: properties.external_format,
+            format: ConversionFormat::of(properties),
             x_chroma_offset: properties.x_chroma_offset,
             y_chroma_offset: properties.y_chroma_offset,
         };
@@ -515,11 +578,17 @@ pub(super) struct ConversionPipeline {
 impl ConversionPipeline {
     fn new(shared: Arc<Shared>, key: ConversionKey) -> Self {
         let device = &shared.device;
+        // A zero external format is the structure's "no external format"
+        // value, so chaining it for a defined-format conversion changes
+        // nothing.
         let mut external_format =
-            vk::ExternalFormatANDROID::default().external_format(key.external_format);
+            vk::ExternalFormatANDROID::default().external_format(match key.format {
+                ConversionFormat::Defined(_) => 0,
+                ConversionFormat::External(external) => external,
+            });
         let conversion_info = vk::SamplerYcbcrConversionCreateInfo::default()
             .push_next(&mut external_format)
-            .format(vk::Format::UNDEFINED)
+            .format(key.format.vk_format())
             // Passes the stored codes through: luma in green, Cb in blue, Cr
             // in red. The consumer applies the matrix the import reports.
             .ycbcr_model(vk::SamplerYcbcrModelConversion::RGB_IDENTITY)
@@ -531,16 +600,16 @@ impl ConversionPipeline {
             .force_explicit_reconstruction(false);
         // SAFETY: the device was opened with the `samplerYcbcrConversion`
         // feature (`request_device`, `DeviceRequirements`). The struct and its
-        // chained external format are locals that outlive the call. An
-        // external-format conversion has format `UNDEFINED`, and the chroma
-        // offsets are the ones the driver suggested for this external format,
-        // so its format features support them.
+        // chained external format are locals that outlive the call. The format
+        // is the one the driver reports for the buffer — a defined format,
+        // `UNDEFINED` with its external format for a buffer it does not map —
+        // and the chroma offsets are the ones the driver suggested for it, so
+        // its format features support them.
         let conversion = unsafe { device.create_sampler_ycbcr_conversion(&conversion_info, None) }
             .unwrap_or_else(|error| {
                 panic!(
-                    "failed to create the VkSamplerYcbcrConversion for external format {:#x}: \
-                     {error}",
-                    key.external_format
+                    "failed to create the VkSamplerYcbcrConversion for the {}: {error}",
+                    key.format
                 )
             });
         let mut conversion_binding =
@@ -715,7 +784,7 @@ fn plane_pipelines(shared: &Shared, layout: vk::PipelineLayout) -> [vk::Pipeline
 
 /// The images one conversion reads and writes.
 pub(super) struct ConversionTargets {
-    /// The imported external-format image.
+    /// The imported image, of the conversion's format.
     pub(super) source: vk::Image,
     /// The `R8Unorm` image, at the frame's extent.
     pub(super) luma: vk::Image,
@@ -790,14 +859,13 @@ impl SourceBinding {
             // descriptors: the binding consumes more than the count.
             Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {
                 Err(HardwareBufferImportError::ConversionDescriptorPool {
-                    external_format: pipeline.key.external_format,
+                    format: pipeline.key.format,
                     descriptor_count: shared.descriptor_count,
                 })
             }
             Err(error) => panic!(
-                "failed to allocate the YCbCr conversion descriptor set for external format \
-                 {:#x}: {error}",
-                pipeline.key.external_format
+                "failed to allocate the YCbCr conversion descriptor set for the {}: {error}",
+                pipeline.key.format
             ),
         }
     }
@@ -843,13 +911,14 @@ impl ConversionFrame {
             .push_next(&mut conversion_binding)
             .image(targets.source)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::UNDEFINED)
+            .format(pipeline.key.format.vk_format())
             .components(vk::ComponentMapping::default())
             .subresource_range(color_subresource());
-        // SAFETY: `targets.source` is a live external-format image created on
-        // this device. A view of it must have format `UNDEFINED`, identity
-        // swizzles, and the conversion created for the same external format,
-        // which `pipeline` was looked up by.
+        // SAFETY: `targets.source` is a live image created on this device by
+        // `import_buffer` for this frame. A view of it must have the image's
+        // own format — `UNDEFINED` for an external-format image — identity
+        // swizzles, and the conversion created for the same format, which
+        // `pipeline` was looked up by.
         let source_view = unsafe { device.create_image_view(&source_view_info, None) }
             .unwrap_or_else(|error| {
                 panic!("failed to create the view of an external-format AHardwareBuffer: {error}")
@@ -866,8 +935,8 @@ impl ConversionFrame {
             .image_info(core::slice::from_ref(&image_info));
         // SAFETY: the set was just allocated with `pipeline`'s layout and no
         // command buffer has bound it. The write fills its one combined image
-        // sampler, whose immutable sampler enables a YCbCr conversion, with a
-        // view created with the same conversion, in the layout the acquire
+        // sampler, whose immutable sampler enables a YCbCr conversion, with
+        // the view created with the same conversion, in the layout the acquire
         // barrier moves the image into before the conversion reads it.
         unsafe { device.update_descriptor_sets(core::slice::from_ref(&write), &[]) };
         let mut frame = Self {

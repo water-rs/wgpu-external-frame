@@ -36,22 +36,18 @@ fn vulkan_adapter() -> wgpu::Adapter {
         backends: wgpu::Backends::VULKAN,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
-    let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-            .expect("the device has no Vulkan adapter");
-    assert!(
-        adapter
-            .features()
-            .contains(wgpu::Features::TEXTURE_FORMAT_NV12),
-        "the Vulkan adapter does not offer TEXTURE_FORMAT_NV12"
-    );
-    adapter
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        .expect("the device has no Vulkan adapter")
 }
 
-fn device_descriptor() -> wgpu::DeviceDescriptor<'static> {
+/// Requests `TEXTURE_FORMAT_NV12` only where the adapter offers it, so the
+/// tests run on devices without it, like the emulator's `MoltenVK`.
+fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
     wgpu::DeviceDescriptor {
         label: Some("ahardware_buffer_test"),
-        required_features: wgpu::Features::TEXTURE_FORMAT_NV12,
+        required_features: adapter
+            .features()
+            .intersection(wgpu::Features::TEXTURE_FORMAT_NV12),
         ..wgpu::DeviceDescriptor::default()
     }
 }
@@ -60,8 +56,24 @@ impl Gpu {
     /// A device opened by `request_device`.
     fn new() -> Self {
         let adapter = vulkan_adapter();
-        let (device, queue) = request_device(&adapter, &device_descriptor())
+        let (device, queue) = request_device(&adapter, &device_descriptor(&adapter))
             .expect("failed to open a device that imports hardware buffers");
+        Self::on(device, queue)
+    }
+
+    /// A device opened by `request_device` without `TEXTURE_FORMAT_NV12`,
+    /// even on an adapter that offers it, so no buffer can alias as `NV12`.
+    fn without_nv12() -> Self {
+        let adapter = vulkan_adapter();
+        let (device, queue) = request_device(
+            &adapter,
+            &wgpu::DeviceDescriptor {
+                label: Some("ahardware_buffer_test"),
+                required_features: wgpu::Features::empty(),
+                ..wgpu::DeviceDescriptor::default()
+            },
+        )
+        .expect("failed to open a device that imports hardware buffers");
         Self::on(device, queue)
     }
 
@@ -71,7 +83,7 @@ impl Gpu {
     /// `VK_KHR_maintenance6`, neither of which the conversion needs.
     fn with_requirements_only() -> Self {
         let adapter = vulkan_adapter();
-        let descriptor = device_descriptor();
+        let descriptor = device_descriptor(&adapter);
         // SAFETY: the adapter is a Vulkan adapter, and the guard is only used
         // to open a device.
         let hal_adapter = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }
@@ -79,9 +91,10 @@ impl Gpu {
         let mut requirements =
             DeviceRequirements::new(&hal_adapter).expect("the adapter imports hardware buffers");
         // SAFETY: the features and limits are the defaults plus
-        // `TEXTURE_FORMAT_NV12`, which `vulkan_adapter` checked the adapter
-        // offers. The callback only adds what `DeviceRequirements::new`
-        // checked the adapter supports, and `requirements` outlives the call.
+        // `TEXTURE_FORMAT_NV12` where the adapter offers it, which
+        // `device_descriptor` checked. The callback only adds what
+        // `DeviceRequirements::new` checked the adapter supports, and
+        // `requirements` outlives the call.
         let open_device = unsafe {
             hal_adapter.open_with_callback(
                 descriptor.required_features,
@@ -442,6 +455,32 @@ fn expected_chroma() -> Vec<u32> {
         .collect()
 }
 
+/// The Vulkan format the driver reports for `buffer`, or `UNDEFINED` when it
+/// describes the buffer only through an external format — what decides which
+/// import path the buffer takes.
+fn driver_format(gpu: &Gpu, buffer: &HardwareBuffer) -> vk::Format {
+    // SAFETY: the test device is a Vulkan device; the guard is only used to
+    // query properties of the test's own buffer.
+    let hal_device = unsafe { gpu.device.as_hal::<wgpu::hal::api::Vulkan>() }
+        .expect("the test device is Vulkan");
+    let loader = ash::android::external_memory_android_hardware_buffer::Device::new(
+        hal_device.shared_instance().raw_instance(),
+        hal_device.raw_device(),
+    );
+    let mut format_properties = vk::AndroidHardwareBufferFormatPropertiesANDROID::default();
+    let mut properties =
+        vk::AndroidHardwareBufferPropertiesANDROID::default().push_next(&mut format_properties);
+    // SAFETY: `buffer` is live for the call and `properties` with its chained
+    // format struct are initialized locals the call writes through; the
+    // extension is enabled on the device.
+    unsafe {
+        loader
+            .get_android_hardware_buffer_properties(buffer.as_ptr().cast(), &mut properties)
+            .expect("failed to query the buffer's Vulkan properties");
+    }
+    format_properties.format
+}
+
 fn read_planes(gpu: &Gpu, planes: &Ycbcr420Planes) {
     assert_eq!(planes.luma.texture().width(), WIDTH);
     assert_eq!(planes.luma.texture().height(), HEIGHT);
@@ -580,6 +619,48 @@ fn ycbcr_420_buffer_imports_as_planes_with_its_codes() {
         assert_eq!(received.try_recv(), Ok(LeaseEvent::Released));
     }
     assert_eq!(received.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+}
+
+/// A device opened without `TEXTURE_FORMAT_NV12` cannot alias an `NV12`
+/// texture, so a `Y8Cb8Cr8_420` buffer converts on the GPU — through a
+/// `VkSamplerYcbcrConversion` built for the defined
+/// `G8_B8R8_2PLANE_420_UNORM` format when the driver maps it, or for its
+/// external format when it does not — and the planes hold the stored codes
+/// exactly.
+#[test]
+fn device_without_nv12_converts_ycbcr_420() {
+    let mut gpu = Gpu::without_nv12();
+    let buffer = allocate(HardwareBufferFormat::Y8Cb8Cr8_420);
+    let format = driver_format(&gpu, &buffer);
+    println!("driver reports {format:?} for the allocated Y8Cb8Cr8_420 buffer");
+    write_ycbcr(&buffer);
+    let (events, received) = mpsc::channel();
+    let ImportedHardwareBuffer::Ycbcr420(planes) = gpu
+        .importer
+        .import(frame(&buffer, None, RecordingLease(events)))
+        .expect("a Y8Cb8Cr8_420 buffer imports without TEXTURE_FORMAT_NV12")
+    else {
+        panic!("a Y8Cb8Cr8_420 buffer imports as YCbCr planes");
+    };
+    // Without `TEXTURE_FORMAT_NV12` the buffer cannot alias, so the planes
+    // must be the conversion's own textures, whichever way the driver
+    // describes the buffer.
+    assert_eq!(
+        planes.luma.texture().format(),
+        wgpu::TextureFormat::R8Unorm,
+        "the buffer ({format:?}) must be converted, not aliased"
+    );
+    assert_eq!(
+        planes.chroma.texture().format(),
+        wgpu::TextureFormat::Rg8Unorm
+    );
+    read_planes(&gpu, &planes);
+    drop(planes);
+    gpu.wait();
+    assert_eq!(
+        received.try_iter().collect::<Vec<_>>(),
+        [LeaseEvent::Presented, LeaseEvent::Released]
+    );
 }
 
 /// A binary semaphore the GPU signals after a long compute dispatch, exported
