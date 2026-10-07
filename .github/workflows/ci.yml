@@ -89,8 +89,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y $LINUX_DEPS
+          sudo apt-get -c .github/apt.conf update
+          sudo apt-get -c .github/apt.conf install -y $LINUX_DEPS
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
       # The runner exposes /dev/kvm but the runner user cannot open it.
@@ -114,6 +114,7 @@ jobs:
           docker run --rm \
             -e KERNEL_PKG -e KVER \
             -v "$PWD/$GUEST_DIR/dl:/dl" \
+            -v "$PWD/.github/apt.conf:/etc/apt/apt.conf.d/99ci:ro" \
             -w /dl \
             "$IMAGE" \
             sh -c 'apt-get update && apt-get download \
@@ -122,6 +123,7 @@ jobs:
           docker run --name guest-rootfs \
             -e GUEST_DEPS -e KVER \
             -v "$PWD/$GUEST_DIR/dl:/dl" \
+            -v "$PWD/.github/apt.conf:/etc/apt/apt.conf.d/99ci:ro" \
             "$IMAGE" \
             sh -c '
               apt-get update
@@ -136,7 +138,7 @@ jobs:
           mkdir -p "$GUEST_DIR/rootfs/work" "$GUEST_DIR/rootfs/cargo"
       - name: Install virtme-ng and QEMU
         run: |
-          sudo apt-get install -y qemu-system-x86
+          sudo apt-get -c .github/apt.conf install -y qemu-system-x86
           pipx install virtme-ng
       - name: Archive the test binaries
         run: >-
@@ -172,8 +174,8 @@ jobs:
           components: clippy, rustfmt
       - name: Install Linux dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y $LINUX_DEPS
+          sudo apt-get -c .github/apt.conf update
+          sudo apt-get -c .github/apt.conf install -y $LINUX_DEPS
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -264,8 +266,8 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - name: Install Linux dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y $LINUX_DEPS
+          sudo apt-get -c .github/apt.conf update
+          sudo apt-get -c .github/apt.conf install -y $LINUX_DEPS
       - uses: Swatinem/rust-cache@v2
       # Proof in the log that the floor is what compiled, so a later change to
       # the pin or the action cannot quietly make this a second stable run.
