@@ -34,7 +34,7 @@ wgpu = "30.0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = "0.38"
-glow = "0.17"
+glow = "0.18"
 libc = "0.2"
 libloading = "0.9"
 sync_wrapper = "1"
@@ -87,3 +87,19 @@ objc2-core-video = { version = "0.3", default-features = false, features = [
     "objc2-io-surface",
 ] }
 pollster = "1"
+
+# wgpu-hal 30.0.1 on crates.io links glow 0.17, and the Linux DMA-BUF path hands
+# its GLES texture names to this crate's own glow context, so both must be the
+# same glow. water-rs/wgpu's v30 branch carries glow 0.18, as wgpu trunk does.
+# Drop this once a wgpu release links glow 0.18.
+[patch.crates-io]
+naga = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+naga-types = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-core = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-core-deps-apple = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-core-deps-emscripten = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-hal = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-naga-bridge = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-types = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
