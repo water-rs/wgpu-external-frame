@@ -356,6 +356,7 @@ impl Gpu {
         .expect("the tests require an adapter");
         match adapter.get_info().backend {
             wgpu::Backend::Vulkan => assert_vulkan_import_supported(&adapter),
+            #[cfg(feature = "gles")]
             wgpu::Backend::Gl => assert_gles_import_supported(&adapter),
             backend => panic!("the tests require a Vulkan or GLES adapter, received {backend:?}"),
         }
@@ -536,6 +537,7 @@ fn assert_vulkan_import_supported(adapter: &wgpu::Adapter) {
 
 /// Asserts the GLES environment the import needs: a `Gl` adapter whose EGL
 /// display offers `EGL_EXT_image_dma_buf_import`.
+#[cfg(feature = "gles")]
 fn assert_gles_import_supported(adapter: &wgpu::Adapter) {
     type EglGetCurrentDisplay = unsafe extern "C" fn() -> *mut core::ffi::c_void;
     type EglQueryString = unsafe extern "C" fn(*mut core::ffi::c_void, i32) -> *const i8;
@@ -703,11 +705,13 @@ fn vulkan_copy_into_orders_the_copy_before_caller_commands() {
 }
 
 #[test]
+#[cfg(feature = "gles")]
 fn gles_copy_to_texture_imports_the_frame() {
     copy_to_texture_imports_the_frame_on(wgpu::Backends::GL);
 }
 
 #[test]
+#[cfg(feature = "gles")]
 fn gles_copy_into_orders_the_copy_before_caller_commands() {
     copy_into_orders_the_copy_before_caller_commands_on(wgpu::Backends::GL, 0);
 }
