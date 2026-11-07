@@ -34,9 +34,15 @@ default = []
 gles = ["wgpu/gles", "dep:glow", "dep:libloading"]
 
 [dependencies]
-wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl", "webgpu"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl"] }
+
+# Each target enables only the wgpu backend its import path uses; GLES comes
+# from the `gles` feature alone.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["webgpu"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan"] }
 ash = "0.38"
 glow = { version = "0.18", default-features = false, optional = true }
 libc = "0.2"
@@ -44,6 +50,7 @@ libloading = { version = "0.9", default-features = false, optional = true }
 sync_wrapper = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan"] }
 ash = "0.38"
 ndk = { version = "0.9", default-features = false, features = ["api-level-26"] }
 sync_wrapper = "1"
@@ -58,6 +65,7 @@ pollster = "1"
 pollster = "1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["metal"] }
 objc2 = "0.6"
 objc2-core-foundation = "0.3"
 objc2-io-surface = "0.3"
@@ -73,7 +81,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 sync_wrapper = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-wgpu = { version = "30.0.1", default-features = false, features = ["gles"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["dx12"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D12",
