@@ -1,32 +1,28 @@
 name: Release
 
+# Every push to `main` runs both jobs: `release` publishes unpublished crates
+# (crates.io trusted publishing rejects OIDC tokens minted under
+# `workflow_run`, and the required `CI result` check on `main` already
+# guarantees the merged commit passed CI), and `release-pr` opens or refreshes
+# the version bump and changelog pull request against `main`. Merging that
+# pull request is the release.
 on:
-  # crates.io trusted publishing rejects OIDC tokens minted under
-  # `workflow_run`, so publishing runs on the `main` push itself, which can
-  # only come from a merged pull request whose required checks already
-  # passed on the same tree. `release-pr` still waits for CI via
-  # `workflow_run`.
   push:
     branches: [main]
-  workflow_run:
-    workflows: ["CI"]
-    branches: [main]
-    types: [completed]
 
 permissions:
   contents: write
   pull-requests: write
   id-token: write
+  actions: write
 
 jobs:
   release:
     name: Release unpublished packages
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       # Mint a short-lived crates.io token from the GitHub OIDC identity
@@ -44,19 +40,27 @@ jobs:
   release-pr:
     name: Prepare the next release
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main'
     concurrency:
-      group: release-plz-${{ github.event.workflow_run.head_branch }}
+      group: release-plz-pr
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: MarcoIeni/release-plz-action@v0.5
+        id: release-plz
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # GitHub holds the pull request runs of a pull request the Actions bot
+      # opened or pushed until they are approved, and the required
+      # `CI result` reports only from those runs.
+      - name: Approve the release PR's CI
+        if: steps.release-plz.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.release-plz.outputs.pr }}
+        run: bash .github/scripts/approve-held-runs.sh "$(jq -er .number <<<"$PR")"

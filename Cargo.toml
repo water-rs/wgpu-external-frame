@@ -29,17 +29,28 @@ cargo = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 multiple_crate_versions = "allow"
 
+[features]
+default = []
+gles = ["wgpu/gles", "dep:glow", "dep:libloading"]
+
 [dependencies]
-wgpu = "30.0.1"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "wgsl"] }
+
+# Each target enables only the wgpu backend its import path uses; GLES comes
+# from the `gles` feature alone.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["webgpu"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan"] }
 ash = "0.38"
-glow = "0.17"
+glow = { version = "0.18", default-features = false, optional = true }
 libc = "0.2"
-libloading = "0.9"
+libloading = { version = "0.9", default-features = false, optional = true }
 sync_wrapper = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["vulkan"] }
 ash = "0.38"
 ndk = { version = "0.9", default-features = false, features = ["api-level-26"] }
 sync_wrapper = "1"
@@ -54,6 +65,7 @@ pollster = "1"
 pollster = "1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["metal"] }
 objc2 = "0.6"
 objc2-core-foundation = "0.3"
 objc2-io-surface = "0.3"
@@ -69,6 +81,7 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 sync_wrapper = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["dx12"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D12",
@@ -87,3 +100,19 @@ objc2-core-video = { version = "0.3", default-features = false, features = [
     "objc2-io-surface",
 ] }
 pollster = "1"
+
+# wgpu-hal 30.0.1 on crates.io links glow 0.17, and the Linux DMA-BUF path hands
+# its GLES texture names to this crate's own glow context, so both must be the
+# same glow. water-rs/wgpu's v30 branch carries glow 0.18, as wgpu trunk does.
+# Drop this once a wgpu release links glow 0.18.
+[patch.crates-io]
+naga = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+naga-types = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-core = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-core-deps-apple = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-core-deps-emscripten = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-hal = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-naga-bridge = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }
+wgpu-types = { git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30" }

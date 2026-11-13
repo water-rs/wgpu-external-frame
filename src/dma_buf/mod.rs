@@ -4,8 +4,9 @@
 //! into. Importing one into `wgpu` needs the platform's own external-memory
 //! path, and which one that is depends on the backend the `wgpu` device runs
 //! on: Vulkan's `VK_EXT_external_memory_dma_buf` or EGL's
-//! `EGL_LINUX_DMA_BUF_EXT`. [`DmaBufImporter`] picks between them once, from
-//! the adapter, and hides the difference behind two operations:
+//! `EGL_LINUX_DMA_BUF_EXT` (requires the `gles` feature). [`DmaBufImporter`]
+//! picks between them once, from the adapter, and hides the difference behind
+//! two operations:
 //!
 //! - [`DmaBufImporter::copy_to_texture`] for producers whose buffer is only
 //!   valid for the duration of a callback: the copy is complete on the GPU
@@ -19,26 +20,34 @@
 //! presenting the padding stretches the picture and draws the gutter.
 
 mod frame;
+#[cfg(feature = "gles")]
 mod gles;
 mod vulkan;
 
 pub use frame::{DRM_FORMAT_MOD_INVALID, DmaBufFormat, DmaBufFrame, DmaBufLease, DmaBufPlane};
 
+#[cfg(feature = "gles")]
 use gles::GlesInterop;
 use vulkan::ImportedVulkanImage;
 
 #[derive(Debug)]
 enum Backend {
     Vulkan,
+    #[cfg(feature = "gles")]
     Gles(Box<GlesInterop>),
 }
 
 fn create_backend(backend: wgpu::Backend, device: &wgpu::Device) -> Backend {
+    #[cfg(not(feature = "gles"))]
+    let _ = device;
     match backend {
         wgpu::Backend::Vulkan => Backend::Vulkan,
+        #[cfg(feature = "gles")]
         wgpu::Backend::Gl => Backend::Gles(Box::new(GlesInterop::new(device))),
         backend => {
-            panic!("DMA-BUF import requires a Vulkan or EGL/GLES wgpu device, received {backend:?}")
+            panic!(
+                "DMA-BUF import requires Vulkan or explicitly enabled EGL/GLES, received {backend:?}"
+            )
         }
     }
 }
@@ -169,6 +178,7 @@ impl DmaBufImporter {
                     })
                     .expect("the Vulkan DMA-BUF copy failed");
             }
+            #[cfg(feature = "gles")]
             Backend::Gles(gles) => {
                 // The GL blit ran outside any submission, so the poll above
                 // cannot cover it; `glFinish` is what makes it complete
@@ -249,6 +259,7 @@ impl DmaBufImporter {
                 command_buffers.extend([acquire.finish(), copy.finish(), release.finish()]);
                 Some(imported)
             }
+            #[cfg(feature = "gles")]
             Backend::Gles(gles) => {
                 // `wgpu` tracks texture initialization lazily: a texture that
                 // has never been written through `wgpu` counts uninitialized,
