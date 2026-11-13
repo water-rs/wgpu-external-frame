@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/water-rs/wgpu-external-frame/compare/v0.4.0...v0.4.1) - 2026-11-13
+
+### Fixed
+
+- *(interop)* enable only each target's own wgpu backend
+
+### Other
+
+- release from main and retire dev
+- *(interop)* make GLES support explicitly opt-in
+- *(deps)* move to glow 0.18 with wgpu-hal
+- pass the release pull request's gate without CI
+
 ## [0.4.0](https://github.com/water-rs/wgpu-external-frame/compare/v0.3.0...v0.4.0) - 2026-10-07
 
 ### Added
